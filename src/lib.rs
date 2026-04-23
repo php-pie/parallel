@@ -260,58 +260,58 @@ impl FileProcessor {
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
         let in_delim = input_delimiter.bytes().next().unwrap_or(b';');
-        let out_delim = output_delimiter.chars().next().unwrap_or(';').to_string();
+        let out_delim = output_delimiter.bytes().next().unwrap_or(b';');
+        let max_out = columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1;
 
         let file = File::open(input_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
         let data: &[u8] = &mmap;
 
-        let mut lines: Vec<&[u8]> = data
-            .split(|&b| b == b'\n')
-            .filter(|l| !l.is_empty())
-            .collect();
-        if skip_header && !lines.is_empty() {
-            lines.remove(0);
-        }
-        let input_count = lines.len() as i64;
+        let mut rdr = csv::ReaderBuilder::new()
+            .delimiter(in_delim)
+            .has_headers(skip_header)
+            .flexible(true)
+            .from_reader(data);
 
-        let max_out = columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1;
+        let out_file = File::create(output_path).map_err(|e| e.to_string())?;
+        let mut wtr = csv::WriterBuilder::new()
+            .delimiter(out_delim)
+            .terminator(csv::Terminator::Any(b'\n'))
+            .from_writer(out_file);
 
-        let results: Vec<Option<String>> = lines
-            .par_iter()
-            .map(|line| {
-                let fields: Vec<&str> = std::str::from_utf8(line)
-                    .ok()?
-                    .split(in_delim as char)
-                    .collect();
-                let mut out_row: Vec<String> = vec![String::new(); max_out];
-                for col in &columns {
-                    let val = fields.get(col.input_index).copied().unwrap_or("");
-                    let mut transformed = val.to_string();
-                    for op in &col.ops {
-                        transformed = op.apply(&transformed);
-                    }
-                    if let Some(v) = &col.validate {
-                        if !v.check(&transformed) {
-                            return None;
-                        }
-                    }
-                    out_row[col.output_index] = transformed;
+        let mut input_count = 0i64;
+        let mut output_count = 0i64;
+        let mut out_row: Vec<String> = vec![String::new(); max_out];
+
+        for result in rdr.records() {
+            let record = result.map_err(|e| e.to_string())?;
+            input_count += 1;
+            for slot in out_row.iter_mut() {
+                slot.clear();
+            }
+            let mut valid = true;
+            for col in &columns {
+                let val = record.get(col.input_index).unwrap_or("");
+                let mut transformed = val.to_string();
+                for op in &col.ops {
+                    transformed = op.apply(&transformed);
                 }
-                Some(out_row.join(&out_delim))
-            })
-            .collect();
-
-        let valid: Vec<&String> = results.iter().filter_map(|r| r.as_ref()).collect();
-        let output_count = valid.len() as i64;
-        let invalid_count = input_count - output_count;
-
-        let mut out = File::create(output_path).map_err(|e| e.to_string())?;
-        for line in valid {
-            writeln!(out, "{}", line).map_err(|e| e.to_string())?;
+                if let Some(v) = &col.validate {
+                    if !v.check(&transformed) {
+                        valid = false;
+                        break;
+                    }
+                }
+                out_row[col.output_index] = transformed;
+            }
+            if valid {
+                wtr.write_record(&out_row).map_err(|e| e.to_string())?;
+                output_count += 1;
+            }
         }
+        wtr.flush().map_err(|e| e.to_string())?;
 
-        Ok(vec![input_count, output_count, invalid_count])
+        Ok(vec![input_count, output_count, input_count - output_count])
     }
 
     /// Processa todos os chunks em paralelo. Retorna [input, output, invalid] totais.
@@ -325,8 +325,8 @@ impl FileProcessor {
         columns_json: &str,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
-        let in_delim = input_delimiter.bytes().next().unwrap_or(b';') as char;
-        let out_delim = output_delimiter.chars().next().unwrap_or(';').to_string();
+        let in_delim = input_delimiter.bytes().next().unwrap_or(b';');
+        let out_delim = output_delimiter.bytes().next().unwrap_or(b';');
         let n = chunks as usize;
         let max_out = columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1;
 
@@ -346,32 +346,39 @@ impl FileProcessor {
                 };
                 let data: &[u8] = &mmap;
 
-                let mut lines: Vec<&[u8]> = data
-                    .split(|&b| b == b'\n')
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                if skip_header && i == 0 && !lines.is_empty() {
-                    lines.remove(0);
-                }
-                let input_count = lines.len() as i64;
+                let has_headers = skip_header && i == 0;
+                let mut rdr = csv::ReaderBuilder::new()
+                    .delimiter(in_delim)
+                    .has_headers(has_headers)
+                    .flexible(true)
+                    .from_reader(data);
 
-                let mut out = match File::create(&out_path) {
+                let out_file = match File::create(&out_path) {
                     Ok(f) => f,
-                    Err(_) => return (input_count, 0, input_count),
+                    Err(_) => return (0, 0, 0),
                 };
-                let mut buf = String::with_capacity(1024 * 1024);
-                let mut output_count = 0i64;
+                let mut wtr = csv::WriterBuilder::new()
+                    .delimiter(out_delim)
+                    .terminator(csv::Terminator::Any(b'\n'))
+                    .buffer_capacity(1024 * 1024)
+                    .from_writer(out_file);
 
-                for line in &lines {
-                    let s = match std::str::from_utf8(line) {
-                        Ok(v) => v,
+                let mut input_count = 0i64;
+                let mut output_count = 0i64;
+                let mut out_row: Vec<String> = vec![String::new(); max_out];
+
+                for result in rdr.records() {
+                    let record = match result {
+                        Ok(r) => r,
                         Err(_) => continue,
                     };
-                    let fields: Vec<&str> = s.split(in_delim).collect();
-                    let mut out_row: Vec<String> = vec![String::new(); max_out];
+                    input_count += 1;
+                    for slot in out_row.iter_mut() {
+                        slot.clear();
+                    }
                     let mut valid = true;
                     for col in &columns {
-                        let val = fields.get(col.input_index).copied().unwrap_or("");
+                        let val = record.get(col.input_index).unwrap_or("");
                         let mut t = val.to_string();
                         for op in &col.ops {
                             t = op.apply(&t);
@@ -387,18 +394,12 @@ impl FileProcessor {
                     if !valid {
                         continue;
                     }
-                    buf.push_str(&out_row.join(&out_delim));
-                    buf.push('\n');
-                    output_count += 1;
-
-                    if buf.len() > 1024 * 1024 {
-                        let _ = out.write_all(buf.as_bytes());
-                        buf.clear();
+                    if wtr.write_record(&out_row).is_err() {
+                        break;
                     }
+                    output_count += 1;
                 }
-                if !buf.is_empty() {
-                    let _ = out.write_all(buf.as_bytes());
-                }
+                let _ = wtr.flush();
 
                 (input_count, output_count, input_count - output_count)
             })
@@ -969,6 +970,64 @@ mod tests {
         let out = read_file(&output);
         assert!(out.contains("12345678909"));
         assert!(!out.contains("11111111111"));
+    }
+
+    #[test]
+    fn process_file_handles_quoted_fields_with_embedded_delimiter() {
+        // Campo entre aspas com ; embutido deve ser preservado como 1 campo só.
+        let dir = unique_temp_dir("proc_file_quoted");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(&input, "1;\"Silva; Júnior\";42\n2;Souza;30\n");
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_file_impl(
+                path_str(&input),
+                path_str(&output),
+                ";",
+                ";",
+                false,
+                r#"[
+                    {"in":0,"out":0,"ops":[]},
+                    {"in":1,"out":1,"ops":["uppercase"]},
+                    {"in":2,"out":2,"ops":[]}
+                ]"#,
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![2, 2, 0]);
+        let out = read_file(&output);
+        // "Silva; Júnior" vira campo único, uppercase aplica em tudo.
+        // csv::Writer re-quota porque contém o delimitador.
+        assert!(out.contains("\"SILVA; JÚNIOR\""));
+        assert!(out.contains("SOUZA"));
+    }
+
+    #[test]
+    fn process_file_handles_quoted_field_with_embedded_quote() {
+        let dir = unique_temp_dir("proc_file_quote_in_quote");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        // Aspas duplas dentro do campo escapadas com "" (padrão RFC 4180)
+        write_file(&input, "1;\"he said \"\"hi\"\"\"\n");
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_file_impl(
+                path_str(&input),
+                path_str(&output),
+                ";",
+                ";",
+                false,
+                r#"[{"in":1,"out":0,"ops":[]}]"#,
+            )
+            .unwrap();
+
+        assert_eq!(res[0], 1);
+        let out = read_file(&output);
+        // output conserva as aspas escapadas
+        assert!(out.contains("he said \"\"hi\"\""));
     }
 
     #[test]
