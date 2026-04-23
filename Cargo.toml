@@ -1,5 +1,5 @@
 [package]
-name = "rust_etl"
+name = "parallel"
 version = "0.1.0"
 edition = "2021"
 

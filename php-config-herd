@@ -1,0 +1,75 @@
+#!/bin/bash
+# php-config shim para Laravel Herd (que não distribui php-config)
+# Emula as respostas usando `php -i` do próprio Herd.
+
+set -e
+
+PHP_BIN="${HERD_PHP_BIN:-$HOME/Library/Application Support/Herd/bin/php84}"
+
+if [[ ! -x "$PHP_BIN" ]]; then
+    echo "php-config shim: PHP binary not found at $PHP_BIN" >&2
+    exit 1
+fi
+
+php_ini_value() {
+    "$PHP_BIN" -r "echo ini_get('$1');"
+}
+
+php_const() {
+    "$PHP_BIN" -r "echo $1;"
+}
+
+case "$1" in
+    --prefix)
+        dirname "$(dirname "$PHP_BIN")"
+        ;;
+    --includes)
+        # Herd não distribui headers. ext-php-rs gera bindings via bindgen
+        # usando wrapper.h; precisa dos headers do PHP. Apontamos pros do
+        # Homebrew mesmo (API 20240924 é igual entre Herd 8.4 e Homebrew 8.4).
+        PREFIX="/opt/homebrew/opt/php@84"
+        [[ -d "$PREFIX/include/php" ]] || PREFIX="/opt/homebrew/opt/php"
+        echo "-I$PREFIX/include/php -I$PREFIX/include/php/main -I$PREFIX/include/php/TSRM -I$PREFIX/include/php/Zend -I$PREFIX/include/php/ext -I$PREFIX/include/php/ext/date/lib"
+        ;;
+    --ldflags)
+        echo ""
+        ;;
+    --libs)
+        echo ""
+        ;;
+    --extension-dir)
+        php_ini_value extension_dir
+        ;;
+    --include-dir)
+        PREFIX="/opt/homebrew/opt/php@84"
+        [[ -d "$PREFIX/include/php" ]] || PREFIX="/opt/homebrew/opt/php"
+        echo "$PREFIX/include/php"
+        ;;
+    --man-dir)
+        echo ""
+        ;;
+    --php-binary)
+        echo "$PHP_BIN"
+        ;;
+    --php-sapis)
+        echo "cli"
+        ;;
+    --configure-options)
+        echo ""
+        ;;
+    --version)
+        php_const PHP_VERSION
+        ;;
+    --vernum)
+        php_const PHP_VERSION_ID
+        ;;
+    *)
+        cat <<EOF
+Usage: php-config [OPTION]
+Options:
+  --prefix --includes --ldflags --libs --extension-dir --include-dir
+  --man-dir --php-binary --php-sapis --configure-options --version --vernum
+EOF
+        exit 1
+        ;;
+esac

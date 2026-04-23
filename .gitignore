@@ -1,4 +1,7 @@
 /target
+pie/*
+!pie/config.m4
+!pie/Makefile.frag
 *.csv
 *.php
 /.idea

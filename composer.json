@@ -1,0 +1,22 @@
+{
+  "name": "php-pie/parallel",
+  "description": "Parallel processing extension for PHP, written in Rust with rayon",
+  "type": "php-ext",
+  "license": "MIT",
+  "keywords": [
+    "parallel",
+    "rayon",
+    "rust",
+    "ext-php-rs",
+    "performance",
+    "etl"
+  ],
+  "require": {
+    "php": ">=8.1"
+  },
+  "php-ext": {
+    "extension-name": "parallel",
+    "build-path": "pie",
+    "configure-options": []
+  }
+}

@@ -1,4 +1,4 @@
-# rust_etl
+# Parallel (Rust)
 
 Extensão PHP escrita em Rust para processamento paralelo de arquivos CSV em pipelines de ETL. Substitui fluxos baseados em `pcntl_fork` com performance 100-500x superior.
 
