@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-ext-php-rs = { git = "https://github.com/davidcole1340/ext-php-rs", branch = "master", optional = true }
+ext-php-rs = { git = "https://github.com/davidcole1340/ext-php-rs", rev = "0b8bf6a557948f4bde24d6f7e179d702ba090613", optional = true }
 rayon = "1.10"
 memmap2 = "0.9"
 serde_json = "1.0"

@@ -35,10 +35,11 @@ impl Operation {
             Operation::Uppercase => s.to_uppercase(),
             Operation::Lowercase => s.to_lowercase(),
             Operation::PadLeft(len, ch) => {
-                if s.len() >= *len {
+                let char_count = s.chars().count();
+                if char_count >= *len {
                     s.to_string()
                 } else {
-                    let pad = ch.to_string().repeat(len - s.len());
+                    let pad = ch.to_string().repeat(len - char_count);
                     format!("{}{}", pad, s)
                 }
             }
@@ -185,24 +186,24 @@ impl FileProcessor {
 
         std::fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
 
-        let counts: Vec<i64> = (0..n)
+        let counts: Result<Vec<i64>, String> = (0..n)
             .into_par_iter()
-            .map(|i| {
+            .map(|i| -> Result<i64, String> {
                 let start = boundaries[i];
                 let end = boundaries[i + 1];
                 let slice = &data[start..end];
                 let path = format!("{}/input_{}.csv", output_dir, i);
-                let mut out = File::create(&path).expect("create chunk");
-                out.write_all(slice).expect("write chunk");
+                let mut out = File::create(&path).map_err(|e| e.to_string())?;
+                out.write_all(slice).map_err(|e| e.to_string())?;
                 let mut count = slice.iter().filter(|&&b| b == b'\n').count() as i64;
                 if !slice.is_empty() && *slice.last().unwrap() != b'\n' {
                     count += 1;
                 }
-                count
+                Ok(count)
             })
             .collect();
 
-        Ok(counts)
+        counts
     }
 
     /// Processa arquivo único aplicando layout. Retorna [input, output, invalid].
@@ -248,6 +249,11 @@ impl FileProcessor {
                     for op in &col.ops {
                         transformed = op.apply(&transformed);
                     }
+                    if let Some(v) = &col.validate {
+                        if !v.check(&transformed) {
+                            return None;
+                        }
+                    }
                     out_row[col.output_index] = transformed;
                 }
                 Some(out_row.join(&out_delim))
@@ -279,7 +285,6 @@ impl FileProcessor {
         let columns = parse_columns(columns_json)?;
         let in_delim = input_delimiter.bytes().next().unwrap_or(b';') as char;
         let out_delim = output_delimiter.chars().next().unwrap_or(';').to_string();
-        eprintln!("out_delim = {:?}", out_delim);
         let n = chunks as usize;
         let max_out = columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1;
 
@@ -303,7 +308,7 @@ impl FileProcessor {
                     .split(|&b| b == b'\n')
                     .filter(|l| !l.is_empty())
                     .collect();
-                if skip_header && !lines.is_empty() {
+                if skip_header && i == 0 && !lines.is_empty() {
                     lines.remove(0);
                 }
                 let input_count = lines.len() as i64;
@@ -622,12 +627,11 @@ mod tests {
     }
 
     #[test]
-    fn op_pad_left_uses_byte_length_not_char_count() {
-        // Comportamento atual: s.len() retorna bytes, não chars.
-        // "á" ocupa 2 bytes em UTF-8, então pad para len=4 gera só 2 chars de pad.
-        // Locked-in para detectar regressão quando corrigirmos.
+    fn op_pad_left_counts_characters_not_bytes() {
+        // "á" são 2 bytes em UTF-8 mas 1 char. Pad para len=4 deve gerar 3 chars de pad.
         let padded = Operation::PadLeft(4, '0').apply("á");
-        assert_eq!(padded, "00á");
+        assert_eq!(padded, "000á");
+        assert_eq!(padded.chars().count(), 4);
     }
 
     #[test]
@@ -900,10 +904,9 @@ mod tests {
     }
 
     #[test]
-    fn process_file_does_not_run_validators_current_behavior() {
-        // BUG atual (intencionalmente travado): process_file não invoca col.validate.
-        // invalid_count é sempre 0 e linhas inválidas aparecem no output.
-        let dir = unique_temp_dir("proc_file_no_validate");
+    fn process_file_filters_invalid_rows_via_validator() {
+        // process_file deve rodar os validators e descartar linhas inválidas.
+        let dir = unique_temp_dir("proc_file_validate");
         let input = dir.join("in.csv");
         let output = dir.join("out.csv");
         write_file(&input, "11111111111\n12345678909\n");
@@ -919,9 +922,10 @@ mod tests {
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
             )
             .unwrap();
-        assert_eq!(res, vec![2, 2, 0]);
+        assert_eq!(res, vec![2, 1, 1]);
         let out = read_file(&output);
-        assert!(out.contains("11111111111"));
+        assert!(out.contains("12345678909"));
+        assert!(!out.contains("11111111111"));
     }
 
     #[test]
@@ -1099,11 +1103,9 @@ mod tests {
     }
 
     #[test]
-    fn full_pipeline_skip_header_drops_first_line_of_each_chunk_current_behavior() {
-        // BUG atual (travado): skip_header=true é aplicado em TODOS os chunks,
-        // não só no que contém o header original. Com split+skip_header,
-        // a primeira linha útil de cada chunk >0 é descartada silenciosamente.
-        // Locked-in para forçar decisão explícita quando consertarmos.
+    fn full_pipeline_skip_header_only_drops_from_first_chunk() {
+        // skip_header=true deve remover o header apenas do chunk 0,
+        // preservando linhas úteis no início dos chunks seguintes.
         let dir = unique_temp_dir("pipeline_skip_header");
         let input = dir.join("input.csv");
         write_file(
@@ -1126,12 +1128,12 @@ mod tests {
             )
             .unwrap();
 
-        // Boundary cai após "...Bob\n" (byte 50/68). Chunks:
+        // Boundary cai após "...Bob\n". Chunks:
         //   chunk 0: header + Alice + Bob  (skip_header descarta header)
         //     -> Alice válida, Bob inválido -> output 1
-        //   chunk 1: Carol  (skip_header trata Carol como "header" e descarta)
-        //     -> output 0
-        // Total output: 1, mesmo com 2 CPFs válidos no input original.
-        assert_eq!(res[1], 1);
+        //   chunk 1: Carol  (skip_header NÃO se aplica a chunks > 0)
+        //     -> Carol válida -> output 1
+        // Total output: 2.
+        assert_eq!(res, vec![3, 2, 1]);
     }
 }

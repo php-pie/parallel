@@ -344,7 +344,7 @@ dependencies = [
 [[package]]
 name = "ext-php-rs"
 version = "0.15.10"
-source = "git+https://github.com/davidcole1340/ext-php-rs?branch=master#0b8bf6a557948f4bde24d6f7e179d702ba090613"
+source = "git+https://github.com/davidcole1340/ext-php-rs?rev=0b8bf6a557948f4bde24d6f7e179d702ba090613#0b8bf6a557948f4bde24d6f7e179d702ba090613"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "ext-php-rs-build"
 version = "0.1.1"
-source = "git+https://github.com/davidcole1340/ext-php-rs?branch=master#0b8bf6a557948f4bde24d6f7e179d702ba090613"
+source = "git+https://github.com/davidcole1340/ext-php-rs?rev=0b8bf6a557948f4bde24d6f7e179d702ba090613#0b8bf6a557948f4bde24d6f7e179d702ba090613"
 dependencies = [
  "anyhow",
 ]
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "ext-php-rs-derive"
 version = "0.11.11"
-source = "git+https://github.com/davidcole1340/ext-php-rs?branch=master#0b8bf6a557948f4bde24d6f7e179d702ba090613"
+source = "git+https://github.com/davidcole1340/ext-php-rs?rev=0b8bf6a557948f4bde24d6f7e179d702ba090613#0b8bf6a557948f4bde24d6f7e179d702ba090613"
 dependencies = [
  "convert_case",
  "darling",
