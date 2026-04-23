@@ -1,0 +1,13 @@
+[package]
+name = "rust_etl"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ext-php-rs = { git = "https://github.com/davidcole1340/ext-php-rs", branch = "master" }
+rayon = "1.10"
+memmap2 = "0.9"
+serde_json = "1.0"
