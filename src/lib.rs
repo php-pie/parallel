@@ -9,7 +9,7 @@ use std::path::Path;
 #[cfg_attr(feature = "extension", php_class)]
 pub struct FileProcessor;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ColumnConfig {
     pub input_index: usize,
     pub output_index: usize,
@@ -17,7 +17,7 @@ pub struct ColumnConfig {
     pub validate: Option<Validator>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Operation {
     Trim,
     DigitsOnly,
@@ -54,24 +54,46 @@ impl Operation {
     }
 }
 
-pub fn parse_op(spec: &str) -> Option<Operation> {
+pub fn parse_op(spec: &str) -> Result<Operation, String> {
     let parts: Vec<&str> = spec.splitn(3, ':').collect();
     match parts[0] {
-        "trim" => Some(Operation::Trim),
-        "digits_only" => Some(Operation::DigitsOnly),
-        "uppercase" => Some(Operation::Uppercase),
-        "lowercase" => Some(Operation::Lowercase),
+        "trim" => Ok(Operation::Trim),
+        "digits_only" => Ok(Operation::DigitsOnly),
+        "uppercase" => Ok(Operation::Uppercase),
+        "lowercase" => Ok(Operation::Lowercase),
         "pad_left" => {
-            let len = parts.get(1)?.parse().ok()?;
-            let ch = parts.get(2)?.chars().next().unwrap_or('0');
-            Some(Operation::PadLeft(len, ch))
+            let len_str = parts.get(1).ok_or_else(|| {
+                "pad_left requires length: 'pad_left:<len>:<char>'".to_string()
+            })?;
+            let len = len_str.parse().map_err(|_| {
+                format!(
+                    "pad_left length must be a non-negative integer, got '{}'",
+                    len_str
+                )
+            })?;
+            let ch_str = parts.get(2).ok_or_else(|| {
+                "pad_left requires pad char: 'pad_left:<len>:<char>'".to_string()
+            })?;
+            let ch = ch_str
+                .chars()
+                .next()
+                .ok_or_else(|| "pad_left pad char cannot be empty".to_string())?;
+            Ok(Operation::PadLeft(len, ch))
         }
-        "strip_ddi" => Some(Operation::StripDdi(parts.get(1)?.to_string())),
-        _ => None,
+        "strip_ddi" => {
+            let ddi = parts
+                .get(1)
+                .ok_or_else(|| "strip_ddi requires prefix: 'strip_ddi:<ddi>'".to_string())?;
+            Ok(Operation::StripDdi(ddi.to_string()))
+        }
+        other => Err(format!(
+            "unknown operation '{}'; expected one of: trim, digits_only, uppercase, lowercase, pad_left, strip_ddi",
+            other
+        )),
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Validator {
     Cpf,
     PhoneBr,
@@ -126,24 +148,44 @@ pub fn validate_phone_br(s: &str) -> bool {
 }
 
 pub fn parse_columns(json: &str) -> Result<Vec<ColumnConfig>, String> {
-    let parsed: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("invalid json: {}", e))?;
-    let arr = parsed.as_array().ok_or("expected array")?;
-    let mut cols = Vec::new();
-    for item in arr {
-        let in_idx = item["in"].as_u64().ok_or("missing 'in'")? as usize;
-        let out_idx = item["out"].as_u64().ok_or("missing 'out'")? as usize;
-        let ops_arr = item["ops"].as_array().ok_or("missing 'ops'")?;
-        let ops: Vec<Operation> = ops_arr
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid json: {}", e))?;
+    let arr = parsed.as_array().ok_or_else(|| "expected array".to_string())?;
+    let mut cols = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let in_idx = item["in"]
+            .as_u64()
+            .ok_or_else(|| format!("column {}: missing or invalid 'in'", idx))?
+            as usize;
+        let out_idx = item["out"]
+            .as_u64()
+            .ok_or_else(|| format!("column {}: missing or invalid 'out'", idx))?
+            as usize;
+        let ops_arr = item["ops"]
+            .as_array()
+            .ok_or_else(|| format!("column {}: missing or invalid 'ops' (must be array)", idx))?;
+        let ops: Result<Vec<Operation>, String> = ops_arr
             .iter()
-            .filter_map(|v| v.as_str())
-            .filter_map(parse_op)
+            .enumerate()
+            .map(|(op_idx, v)| {
+                let spec = v.as_str().ok_or_else(|| {
+                    format!("column {}: ops[{}] must be a string", idx, op_idx)
+                })?;
+                parse_op(spec).map_err(|e| format!("column {}: ops[{}]: {}", idx, op_idx, e))
+            })
             .collect();
-        let validate = item["validate"].as_str().and_then(|s| match s {
-            "cpf" => Some(Validator::Cpf),
-            "phone_br" => Some(Validator::PhoneBr),
-            _ => None,
-        });
+        let ops = ops?;
+        let validate = match item["validate"].as_str() {
+            None => None,
+            Some("cpf") => Some(Validator::Cpf),
+            Some("phone_br") => Some(Validator::PhoneBr),
+            Some(other) => {
+                return Err(format!(
+                    "column {}: unknown validator '{}'; expected one of: cpf, phone_br",
+                    idx, other
+                ))
+            }
+        };
         cols.push(ColumnConfig {
             input_index: in_idx,
             output_index: out_idx,
@@ -662,24 +704,24 @@ mod tests {
 
     #[test]
     fn parse_op_trim() {
-        assert!(matches!(parse_op("trim"), Some(Operation::Trim)));
+        assert!(matches!(parse_op("trim"), Ok(Operation::Trim)));
     }
 
     #[test]
     fn parse_op_digits_only() {
-        assert!(matches!(parse_op("digits_only"), Some(Operation::DigitsOnly)));
+        assert!(matches!(parse_op("digits_only"), Ok(Operation::DigitsOnly)));
     }
 
     #[test]
     fn parse_op_uppercase_lowercase() {
-        assert!(matches!(parse_op("uppercase"), Some(Operation::Uppercase)));
-        assert!(matches!(parse_op("lowercase"), Some(Operation::Lowercase)));
+        assert!(matches!(parse_op("uppercase"), Ok(Operation::Uppercase)));
+        assert!(matches!(parse_op("lowercase"), Ok(Operation::Lowercase)));
     }
 
     #[test]
     fn parse_op_pad_left_with_args() {
         match parse_op("pad_left:11:0") {
-            Some(Operation::PadLeft(len, ch)) => {
+            Ok(Operation::PadLeft(len, ch)) => {
                 assert_eq!(len, 11);
                 assert_eq!(ch, '0');
             }
@@ -688,23 +730,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_op_pad_left_missing_args_returns_none() {
-        assert!(parse_op("pad_left").is_none());
-        assert!(parse_op("pad_left:notanumber:0").is_none());
+    fn parse_op_pad_left_missing_args_returns_err() {
+        assert!(parse_op("pad_left").is_err());
+        assert!(parse_op("pad_left:notanumber:0").is_err());
     }
 
     #[test]
     fn parse_op_strip_ddi_with_value() {
         match parse_op("strip_ddi:55") {
-            Some(Operation::StripDdi(ddi)) => assert_eq!(ddi, "55"),
+            Ok(Operation::StripDdi(ddi)) => assert_eq!(ddi, "55"),
             _ => panic!("expected StripDdi"),
         }
     }
 
     #[test]
-    fn parse_op_unknown_returns_none() {
-        assert!(parse_op("trimm").is_none());
-        assert!(parse_op("").is_none());
+    fn parse_op_unknown_returns_err() {
+        let err = parse_op("trimm").unwrap_err();
+        assert!(err.contains("unknown operation"));
+        assert!(err.contains("trimm"));
+        assert!(parse_op("").is_err());
     }
 
     // ===========================================================
@@ -737,19 +781,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_columns_unknown_validator_becomes_none() {
-        // Comportamento atual: validator desconhecido é silenciosamente descartado
+    fn parse_columns_rejects_unknown_validator() {
         let json = r#"[{"in":0,"out":0,"ops":[],"validate":"cnpj"}]"#;
-        let cols = parse_columns(json).unwrap();
-        assert!(cols[0].validate.is_none());
+        let err = parse_columns(json).unwrap_err();
+        assert!(err.contains("unknown validator"));
+        assert!(err.contains("cnpj"));
     }
 
     #[test]
-    fn parse_columns_silently_ignores_unknown_ops() {
-        // Comportamento atual: ops desconhecidas são descartadas via filter_map
+    fn parse_columns_rejects_unknown_ops() {
         let json = r#"[{"in":0,"out":0,"ops":["trim","not_a_real_op","uppercase"]}]"#;
-        let cols = parse_columns(json).unwrap();
-        assert_eq!(cols[0].ops.len(), 2);
+        let err = parse_columns(json).unwrap_err();
+        assert!(err.contains("not_a_real_op"));
     }
 
     #[test]
