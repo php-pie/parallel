@@ -2,6 +2,7 @@
 use ext_php_rs::prelude::*;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -28,29 +29,90 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub fn apply(&self, s: &str) -> String {
+    /// Aplica a operação em `s`. Retorna `Cow::Borrowed` quando nada muda,
+    /// evitando alocação no hot path para transformações no-op.
+    pub fn apply<'a>(&self, s: &'a str) -> Cow<'a, str> {
         match self {
-            Operation::Trim => s.trim().to_string(),
-            Operation::DigitsOnly => s.chars().filter(|c| c.is_ascii_digit()).collect(),
-            Operation::Uppercase => s.to_uppercase(),
-            Operation::Lowercase => s.to_lowercase(),
+            Operation::Trim => {
+                let t = s.trim();
+                if t.len() == s.len() {
+                    Cow::Borrowed(s)
+                } else {
+                    Cow::Borrowed(t)
+                }
+            }
+            Operation::DigitsOnly => {
+                if s.bytes().all(|b| b.is_ascii_digit()) {
+                    Cow::Borrowed(s)
+                } else {
+                    Cow::Owned(s.chars().filter(|c| c.is_ascii_digit()).collect())
+                }
+            }
+            Operation::Uppercase => {
+                if s.bytes().all(|b| !b.is_ascii_lowercase()) && s.is_ascii() {
+                    Cow::Borrowed(s)
+                } else {
+                    Cow::Owned(s.to_uppercase())
+                }
+            }
+            Operation::Lowercase => {
+                if s.bytes().all(|b| !b.is_ascii_uppercase()) && s.is_ascii() {
+                    Cow::Borrowed(s)
+                } else {
+                    Cow::Owned(s.to_lowercase())
+                }
+            }
             Operation::PadLeft(len, ch) => {
                 let char_count = s.chars().count();
                 if char_count >= *len {
-                    s.to_string()
+                    Cow::Borrowed(s)
                 } else {
-                    let pad = ch.to_string().repeat(len - char_count);
-                    format!("{}{}", pad, s)
+                    let needed = len - char_count;
+                    let mut out = String::with_capacity(needed * ch.len_utf8() + s.len());
+                    for _ in 0..needed {
+                        out.push(*ch);
+                    }
+                    out.push_str(s);
+                    Cow::Owned(out)
                 }
             }
             Operation::StripDdi(ddi) => {
-                if s.starts_with(ddi) && s.len() > ddi.len() {
-                    s[ddi.len()..].to_string()
+                if s.starts_with(ddi.as_str()) && s.len() > ddi.len() {
+                    Cow::Borrowed(&s[ddi.len()..])
                 } else {
-                    s.to_string()
+                    Cow::Borrowed(s)
                 }
             }
         }
+    }
+}
+
+/// Encadeia `Operation::apply` preservando o lifetime `'a` da `Cow` de entrada.
+///
+/// `op.apply(&input)` pode retornar três formas de Cow:
+///   1. `Borrowed(b)` onde b aponta para todo o input → no-op, reaproveita `input`.
+///   2. `Borrowed(b)` onde b é subslice de input → precisa ser convertido em
+///      `Owned` porque o subslice tem lifetime amarrado ao stack, não a `'a`.
+///   3. `Owned(s)` → move direto.
+fn apply_op<'a>(op: &Operation, input: Cow<'a, str>) -> Cow<'a, str> {
+    let (is_identity, owned) = {
+        let result = op.apply(&input);
+        match result {
+            Cow::Borrowed(b) => {
+                let input_ref: &str = &input;
+                if b.as_ptr() == input_ref.as_ptr() && b.len() == input_ref.len() {
+                    (true, None)
+                } else {
+                    (false, Some(b.to_string()))
+                }
+            }
+            Cow::Owned(s) => (false, Some(s)),
+        }
+    };
+    if is_identity {
+        input
+    } else {
+        Cow::Owned(owned.unwrap())
     }
 }
 
@@ -292,9 +354,9 @@ impl FileProcessor {
             let mut valid = true;
             for col in &columns {
                 let val = record.get(col.input_index).unwrap_or("");
-                let mut transformed = val.to_string();
+                let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
                 for op in &col.ops {
-                    transformed = op.apply(&transformed);
+                    transformed = apply_op(op, transformed);
                 }
                 if let Some(v) = &col.validate {
                     if !v.check(&transformed) {
@@ -302,7 +364,7 @@ impl FileProcessor {
                         break;
                     }
                 }
-                out_row[col.output_index] = transformed;
+                out_row[col.output_index].push_str(&transformed);
             }
             if valid {
                 wtr.write_record(&out_row).map_err(|e| e.to_string())?;
@@ -379,17 +441,17 @@ impl FileProcessor {
                     let mut valid = true;
                     for col in &columns {
                         let val = record.get(col.input_index).unwrap_or("");
-                        let mut t = val.to_string();
+                        let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
                         for op in &col.ops {
-                            t = op.apply(&t);
+                            transformed = apply_op(op, transformed);
                         }
                         if let Some(v) = &col.validate {
-                            if !v.check(&t) {
+                            if !v.check(&transformed) {
                                 valid = false;
                                 break;
                             }
                         }
-                        out_row[col.output_index] = t;
+                        out_row[col.output_index].push_str(&transformed);
                     }
                     if !valid {
                         continue;
@@ -639,6 +701,46 @@ mod tests {
     fn op_trim_removes_surrounding_whitespace() {
         assert_eq!(Operation::Trim.apply("  hello  "), "hello");
         assert_eq!(Operation::Trim.apply("\t\nfoo\n "), "foo");
+    }
+
+    #[test]
+    fn op_trim_returns_borrowed_when_already_trimmed() {
+        // Sem whitespace para remover → zero alocação
+        let input = "hello";
+        let result = Operation::Trim.apply(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn op_uppercase_returns_borrowed_when_already_upper_ascii() {
+        let input = "ABC123";
+        let result = Operation::Uppercase.apply(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn op_lowercase_returns_borrowed_when_already_lower_ascii() {
+        let input = "abc123";
+        let result = Operation::Lowercase.apply(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn op_digits_only_returns_borrowed_when_already_digits() {
+        let input = "12345";
+        let result = Operation::DigitsOnly.apply(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn op_strip_ddi_returns_borrowed_slice_when_prefix_matches() {
+        // Subslice do input → Borrowed (no-alloc)
+        let input = "5511987654321";
+        let result = Operation::StripDdi("55".into()).apply(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, "11987654321");
     }
 
     #[test]
