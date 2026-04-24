@@ -494,10 +494,30 @@ O parâmetro `$columnsJson` define o pipeline de transformação de cada coluna.
 | `cpf_canonical` | Canonicaliza como CPF (11 dígitos) e valida. Se inválido, retorna `""` | `"123.456.789-09"` → `"12345678909"` |
 | `cnpj_canonical` | Canonicaliza como CNPJ (14 dígitos) e valida. Se inválido, retorna `""` | `"11.222.333/0001-81"` → `"11222333000181"` |
 | `document_canonical` | Detecta automaticamente CPF ou CNPJ e canonicaliza. Se nenhum dos dois, retorna `""` | `"123.456.789-09"` → `"12345678909"`; `"11222333000181"` → `"11222333000181"` |
+| `constant:<valor>` | Ignora o valor de entrada e emite o literal fornecido. Útil para injetar colunas fixas (tenant_id, job_id, timestamp) na saída sem que existam no input. Tudo após o **primeiro** `:` é parte do valor | `constant:42` sempre emite `"42"`; `constant:tenant_abc` sempre emite `"tenant_abc"`; `constant:2026-04-24T10:30:00` emite o timestamp completo |
 
 As operações são aplicadas **na ordem declarada**. Em `["digits_only", "pad_left:11:0"]`, primeiro remove não-dígitos, depois preenche com zeros.
 
 **Padrão `canonical + not_blank`:** ops terminadas em `_canonical` retornam `""` quando inválidas (campo vira em branco, mas a linha fica). Se o campo é obrigatório (ex: chave primária do registro), combine com o validator `not_blank` — aí a linha inteira é descartada. Ver seção de validadores.
+
+**Padrão `constant:<valor>` — colunas fixas na saída:** use quando a saída precisa de colunas que não existem no input (`tenant_id`, `job_id`, timestamp, marcadores de versão, etc.). O `in` pode ser qualquer índice válido — o op `constant` ignora o input e sempre emite o literal. Em `processParallelDenormalize`, coloque as colunas constantes com `in` **menor que `staticCols`** para que sejam classificadas como prefixo e apareçam também em fallbacks `emit_prefix_on_all_invalid`.
+
+Exemplo: adicionar `tenant_id` e `job_id` fixos à saída do cenário document+DDD+phone:
+
+```php
+$tenantId = 'tenant_abc';
+$jobId    = '42';
+
+$layout = json_encode([
+    ['in' => 0, 'out' => 0, 'ops' => ["constant:$jobId"]],                          // job_id (constante)
+    ['in' => 0, 'out' => 1, 'ops' => ["constant:$tenantId"]],                        // tenant_id (constante)
+    ['in' => 0, 'out' => 2, 'ops' => ['digits_only'], 'validate' => 'document'],     // document (do input)
+    ['in' => 1, 'out' => 3, 'ops' => ['digits_only'], 'validate' => 'area_code'],    // ddd (do input)
+    ['in' => 2, 'out' => 4, 'ops' => ['digits_only'], 'validate' => 'phone'],        // phone (do input)
+]);
+
+// Output de cada linha: "42;tenant_abc;33176825404;82;987148038"
+```
 
 ### Validadores disponíveis (`validate`)
 

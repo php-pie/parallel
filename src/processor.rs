@@ -2487,6 +2487,68 @@ mod tests {
         assert_eq!(out, expected);
     }
 
+    #[test]
+    fn parallel_denormalize_with_constant_tenant_and_job_columns() {
+        // Cenário real: além de document/ddd/phone, a saída precisa
+        // carregar colunas FIXAS (tenant_id e job_id) que não existem no
+        // input. Modeladas como prefixo (in < static_cols) com `constant:X`.
+        //
+        // Layout:
+        //   col 0 (out 0): job_id        = constante "42"
+        //   col 1 (out 1): tenant_id     = constante "tenant_abc"
+        //   col 2 (out 2): document      (digits_only + validate document)
+        //   col 3 (out 3): ddd           (digits_only + validate area_code)
+        //   col 4 (out 4): phone         (digits_only + validate phone)
+        //
+        // Tudo com `in: 0` para as colunas constantes funciona: elas
+        // classificam como prefixo (in < static_cols=1) mas o op `constant`
+        // ignora o valor de entrada.
+        let dir = unique_temp_dir("pp_denorm_constants");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(
+            &input,
+            "33176825404;82;987148038;82;987432606\n\
+             34829718897;0;997979072\n",
+        );
+
+        let layout = r#"[
+            {"in":0,"out":0,"ops":["constant:42"]},
+            {"in":0,"out":1,"ops":["constant:tenant_abc"]},
+            {"in":0,"out":2,"ops":["digits_only"],"validate":"document"},
+            {"in":1,"out":3,"ops":["digits_only"],"validate":"area_code"},
+            {"in":2,"out":4,"ops":["digits_only"],"validate":"phone"}
+        ]"#;
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_denormalize_impl(
+                path_str(&input),
+                path_str(&output),
+                1,
+                ";",
+                ";",
+                false,
+                1, // static_cols
+                2, // group_size
+                layout,
+                false,
+                "never",
+                true, // emit_prefix_on_all_invalid
+            )
+            .unwrap();
+
+        // linha 1: 2 grupos válidos → 2 linhas com constantes
+        // linha 2: DDD=0 inválido → 1 fallback com constantes + doc + blanks
+        assert_eq!(res, vec![2, 3, 1]);
+
+        let out = read_file(&output);
+        let expected = "42;tenant_abc;33176825404;82;987148038\n\
+                        42;tenant_abc;33176825404;82;987432606\n\
+                        42;tenant_abc;34829718897;;\n";
+        assert_eq!(out, expected);
+    }
+
     // ===========================================================
     // process_parallel_denormalize_impl (com arquivos reais)
     // ===========================================================

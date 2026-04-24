@@ -25,6 +25,13 @@ pub enum Operation {
     /// Senão → tenta CPF (11 dig); se falhar, tenta CNPJ (14 dig).
     /// Retorna canônico válido ou `""`.
     DocumentCanonical,
+    /// Ignora o valor de entrada e emite sempre o literal fornecido.
+    /// Útil para injetar colunas constantes na saída (ex.: `tenant_id`,
+    /// `job_id`, `created_at` fixo) sem que esses valores precisem existir
+    /// no arquivo de entrada. Sintaxe no layout JSON: `"constant:<valor>"`.
+    /// Tudo após o primeiro `:` vira parte do valor, então `"constant:a:b"`
+    /// emite `"a:b"`.
+    Constant(String),
 }
 
 /// Pega os últimos `n` chars de `s` (se len >= n) ou left-pad com `'0'`
@@ -151,6 +158,7 @@ impl Operation {
                 }
                 Cow::Owned(String::new())
             }
+            Operation::Constant(value) => Cow::Owned(value.clone()),
         }
     }
 }
@@ -220,8 +228,16 @@ pub fn parse_op(spec: &str) -> Result<Operation, String> {
         "cpf_canonical" => Ok(Operation::CpfCanonical),
         "cnpj_canonical" => Ok(Operation::CnpjCanonical),
         "document_canonical" => Ok(Operation::DocumentCanonical),
+        "constant" => {
+            // Tudo após o primeiro `:` é o valor literal — aceita `:` e
+            // outros separadores dentro do valor.
+            let value = spec.strip_prefix("constant:").ok_or_else(|| {
+                "constant requires value: 'constant:<value>'".to_string()
+            })?;
+            Ok(Operation::Constant(value.to_string()))
+        }
         other => Err(format!(
-            "unknown operation '{}'; expected one of: trim, digits_only, uppercase, lowercase, pad_left, strip_ddi, remove_leading_zeroes, cpf_canonical, cnpj_canonical, document_canonical",
+            "unknown operation '{}'; expected one of: trim, digits_only, uppercase, lowercase, pad_left, strip_ddi, remove_leading_zeroes, cpf_canonical, cnpj_canonical, document_canonical, constant",
             other
         )),
     }
@@ -542,5 +558,79 @@ mod tests {
             parse_op("document_canonical"),
             Ok(Operation::DocumentCanonical)
         ));
+    }
+
+    // ===========================================================
+    // constant
+    // ===========================================================
+
+    #[test]
+    fn constant_emits_fixed_value_ignoring_input() {
+        let op = Operation::Constant("tenant_abc".to_string());
+        // Input value is ignored — always emits the literal.
+        assert_eq!(op.apply("anything"), "tenant_abc");
+        assert_eq!(op.apply(""), "tenant_abc");
+        assert_eq!(op.apply("33176825404"), "tenant_abc");
+    }
+
+    #[test]
+    fn constant_empty_value_emits_empty() {
+        // `constant:` (nothing after colon) produces empty string,
+        // effectively a `blank` op.
+        let op = Operation::Constant(String::new());
+        assert_eq!(op.apply("whatever"), "");
+    }
+
+    #[test]
+    fn parse_op_constant_simple_value() {
+        match parse_op("constant:tenant_abc") {
+            Ok(Operation::Constant(v)) => assert_eq!(v, "tenant_abc"),
+            other => panic!("expected Constant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_op_constant_numeric_value() {
+        match parse_op("constant:42") {
+            Ok(Operation::Constant(v)) => assert_eq!(v, "42"),
+            _ => panic!("expected Constant"),
+        }
+    }
+
+    #[test]
+    fn parse_op_constant_empty_value() {
+        // `constant:` (nothing after colon) → Constant("")
+        match parse_op("constant:") {
+            Ok(Operation::Constant(v)) => assert_eq!(v, ""),
+            _ => panic!("expected Constant with empty string"),
+        }
+    }
+
+    #[test]
+    fn parse_op_constant_preserves_colons_in_value() {
+        // Everything after the FIRST `:` is part of the value.
+        // Important for values like timestamps or URLs.
+        match parse_op("constant:2026-04-24T10:30:00") {
+            Ok(Operation::Constant(v)) => assert_eq!(v, "2026-04-24T10:30:00"),
+            _ => panic!("expected Constant"),
+        }
+    }
+
+    #[test]
+    fn parse_op_constant_without_colon_errors() {
+        // Bare `constant` with no colon is an error — explicit prefix required.
+        let err = parse_op("constant").unwrap_err();
+        assert!(err.contains("constant"));
+        assert!(err.contains("requires value"));
+    }
+
+    #[test]
+    fn parse_op_constant_chained_in_layout_pattern() {
+        // Simulates how a layout would use it: constant chained with nothing
+        // else. The op should work as the sole op in a column's pipeline.
+        let op = parse_op("constant:job_42").unwrap();
+        let input_val = "ignore_me";
+        let result = op.apply(input_val);
+        assert_eq!(result, "job_42");
     }
 }
