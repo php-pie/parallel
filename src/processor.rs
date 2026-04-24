@@ -40,6 +40,28 @@ fn needs_formula_escape(s: &str) -> bool {
     )
 }
 
+/// Calcula N+1 boundaries em `data` alinhadas a `\n`, dividindo em N
+/// ranges aproximadamente iguais em bytes mas sempre terminando em quebra
+/// de linha. Garante que nenhum range parte uma linha no meio.
+///
+/// Usado tanto pelo split em disco (`split_file_impl`) quanto pelo
+/// pipeline single-pass (`process_parallel_impl`).
+fn compute_line_boundaries(data: &[u8], n: usize) -> Vec<usize> {
+    let len = data.len();
+    let mut boundaries = Vec::with_capacity(n + 1);
+    boundaries.push(0usize);
+    for i in 1..n {
+        let approx = len * i / n;
+        let adjusted = match data[approx..].iter().position(|&b| b == b'\n') {
+            Some(off) => approx + off + 1,
+            None => len,
+        };
+        boundaries.push(adjusted);
+    }
+    boundaries.push(len);
+    boundaries
+}
+
 fn csv_reader<R: std::io::Read>(delim: u8, has_headers: bool, reader: R) -> csv::Reader<R> {
     csv::ReaderBuilder::new()
         .delimiter(delim)
@@ -159,20 +181,9 @@ impl FileProcessor {
         let file = File::open(input_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
         let data: &[u8] = &mmap;
-        let len = data.len();
         let n = chunks.max(1) as usize;
 
-        let mut boundaries = Vec::with_capacity(n + 1);
-        boundaries.push(0usize);
-        for i in 1..n {
-            let approx = len * i / n;
-            let adjusted = match data[approx..].iter().position(|&b| b == b'\n') {
-                Some(off) => approx + off + 1,
-                None => len,
-            };
-            boundaries.push(adjusted);
-        }
-        boundaries.push(len);
+        let boundaries = compute_line_boundaries(data, n);
 
         std::fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
 
@@ -316,6 +327,87 @@ impl FileProcessor {
         Ok(vec![totals.0, totals.1, totals.2])
     }
 
+    /// Pipeline single-pass: mmap do input, paraleliza N ranges em threads
+    /// rayon (cada thread processa seu range e escreve num buffer de
+    /// memória), concatena os buffers no output final. Zero arquivos
+    /// temporários, ~3x menos I/O comparado ao fluxo split + chunks + merge.
+    ///
+    /// Preserva a ordem das linhas porque os buffers são escritos em
+    /// ordem de chunk (0, 1, 2, ...).
+    ///
+    /// Retorna `[input_total, output_total, invalid_total]`.
+    ///
+    /// Use esse método para o caso comum. O fluxo de 3 chamadas
+    /// (`split_file_impl` + `process_chunks_impl` + `merge_files_impl`)
+    /// continua disponível para quando você precisa de checkpoints em
+    /// disco entre etapas (ex.: retomar um pipeline depois de crash).
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_parallel_impl(
+        &self,
+        input_path: &str,
+        output_path: &str,
+        chunks: i64,
+        input_delimiter: &str,
+        output_delimiter: &str,
+        skip_header: bool,
+        columns_json: &str,
+        escape_formulas: bool,
+    ) -> Result<Vec<i64>, String> {
+        let columns = parse_columns(columns_json)?;
+        let in_delim = parse_delimiter(input_delimiter, b';');
+        let out_delim = parse_delimiter(output_delimiter, b';');
+        let n = chunks.max(1) as usize;
+
+        let file = File::open(input_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
+        let data: &[u8] = &mmap;
+
+        let boundaries = compute_line_boundaries(data, n);
+
+        // Cada thread processa seu range de bytes e escreve num Vec<u8>
+        // próprio (sem contention). `has_headers` só no chunk 0.
+        let results: Result<Vec<(Vec<u8>, i64, i64, i64)>, String> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<(Vec<u8>, i64, i64, i64), String> {
+                let start = boundaries[i];
+                let end = boundaries[i + 1];
+                let slice = &data[start..end];
+                let has_headers = skip_header && i == 0;
+                // Capacidade inicial ~= tamanho do input slice. Output
+                // costuma ser <= input após ops/validate.
+                let mut buffer: Vec<u8> = Vec::with_capacity(slice.len());
+                let (input, output, invalid) = process_records(
+                    slice,
+                    &mut buffer,
+                    in_delim,
+                    out_delim,
+                    has_headers,
+                    &columns,
+                    escape_formulas,
+                )?;
+                Ok((buffer, input, output, invalid))
+            })
+            .collect();
+        let results = results?;
+
+        // Serializa a escrita final. BufWriter reduz syscalls porque cada
+        // buffer costuma ser grande (MBs) e write_all emitiria um write
+        // gigante — BufWriter quebra em pedaços de 8KB por default, o que
+        // é ok pro kernel. A ordem dos buffers preserva a ordem das linhas.
+        let out_file = File::create(output_path).map_err(|e| e.to_string())?;
+        let mut writer = std::io::BufWriter::new(out_file);
+        let mut totals = (0i64, 0i64, 0i64);
+        for (buffer, input, output, invalid) in results {
+            writer.write_all(&buffer).map_err(|e| e.to_string())?;
+            totals.0 += input;
+            totals.1 += output;
+            totals.2 += invalid;
+        }
+        writer.flush().map_err(|e| e.to_string())?;
+
+        Ok(vec![totals.0, totals.1, totals.2])
+    }
+
     /// Concatena arquivos output_*.csv em um único arquivo final.
     pub fn merge_files_impl(
         &self,
@@ -411,6 +503,31 @@ impl FileProcessor {
     ) -> PhpResult<i64> {
         self.merge_files_impl(&input_dir, &output_path, chunks)
             .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_parallel(
+        &self,
+        input_path: String,
+        output_path: String,
+        chunks: i64,
+        input_delimiter: String,
+        output_delimiter: String,
+        skip_header: bool,
+        columns_json: String,
+        escape_formulas: Option<bool>,
+    ) -> PhpResult<Vec<i64>> {
+        self.process_parallel_impl(
+            &input_path,
+            &output_path,
+            chunks,
+            &input_delimiter,
+            &output_delimiter,
+            skip_header,
+            &columns_json,
+            escape_formulas.unwrap_or(true),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -984,6 +1101,271 @@ mod tests {
             .unwrap();
         assert_eq!(total, 2);
         assert_eq!(read_file(&final_path), "a\nc\n");
+    }
+
+    // ===========================================================
+    // process_parallel_impl (single-call, sem temp files)
+    // ===========================================================
+
+    #[test]
+    fn process_parallel_basic_single_chunk() {
+        // Com chunks=1 deve se comportar como o pipeline single-threaded.
+        let dir = unique_temp_dir("pp_single");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(&input, "alice;30\nbob;25\n");
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                1,
+                ";",
+                ";",
+                false,
+                r#"[{"in":0,"out":0,"ops":["uppercase"]},{"in":1,"out":1,"ops":[]}]"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![2, 2, 0]);
+        assert_eq!(read_file(&output), "ALICE;30\nBOB;25\n");
+    }
+
+    #[test]
+    fn process_parallel_preserves_line_order() {
+        // Buffers são escritos em ordem de chunk (0, 1, 2, ...) então a
+        // ordem das linhas no output deve bater com a do input.
+        let dir = unique_temp_dir("pp_order");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        let content: String = (0..100).map(|i| format!("row_{:03};{}\n", i, i * 7)).collect();
+        write_file(&input, &content);
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                4,
+                ";",
+                ";",
+                false,
+                r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![100, 100, 0]);
+        let out = read_file(&output);
+        // Primeira e última linha devem estar no lugar esperado
+        assert!(out.starts_with("row_000;0\n"));
+        assert!(out.ends_with("row_099;693\n"));
+        // Ordem global preservada
+        let lines: Vec<&str> = out.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(*line, format!("row_{:03};{}", i, i * 7));
+        }
+    }
+
+    #[test]
+    fn process_parallel_filters_invalid_rows() {
+        let dir = unique_temp_dir("pp_validate");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(
+            &input,
+            "12345678909;Alice\n11111111111;Bob\n12345678909;Carol\n",
+        );
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                2,
+                ";",
+                ";",
+                false,
+                r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"},{"in":1,"out":1,"ops":["uppercase"]}]"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![3, 2, 1]);
+        let out = read_file(&output);
+        assert!(out.contains("ALICE"));
+        assert!(out.contains("CAROL"));
+        assert!(!out.contains("BOB"));
+    }
+
+    #[test]
+    fn process_parallel_skip_header_only_affects_first_chunk() {
+        let dir = unique_temp_dir("pp_header");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        // Header + 3 linhas de dados
+        write_file(
+            &input,
+            "name;age\nalice;30\nbob;25\ncarol;40\n",
+        );
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                2,
+                ";",
+                ";",
+                true,
+                r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#,
+                true,
+            )
+            .unwrap();
+
+        // 3 linhas de dados no input (header skipped uma única vez)
+        assert_eq!(res[0], 3);
+        assert_eq!(res[1], 3);
+
+        let out = read_file(&output);
+        assert!(!out.contains("name;age"));
+        assert!(out.contains("alice;30"));
+        assert!(out.contains("bob;25"));
+        assert!(out.contains("carol;40"));
+    }
+
+    #[test]
+    fn process_parallel_escapes_formulas_by_default() {
+        let dir = unique_temp_dir("pp_escape");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(&input, "1;=HYPERLINK(\"http://evil\",\"go\")\n");
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                2,
+                ";",
+                ";",
+                false,
+                r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![1, 1, 0]);
+        let out = read_file(&output);
+        assert!(out.contains("'=HYPERLINK"));
+    }
+
+    #[test]
+    fn process_parallel_opt_out_of_escape() {
+        let dir = unique_temp_dir("pp_no_escape");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(&input, "=1+1\n");
+
+        let fp = FileProcessor;
+        fp.process_parallel_impl(
+            path_str(&input),
+            path_str(&output),
+            1,
+            ";",
+            ";",
+            false,
+            r#"[{"in":0,"out":0,"ops":[]}]"#,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(read_file(&output), "=1+1\n");
+    }
+
+    #[test]
+    fn process_parallel_handles_chunks_larger_than_records() {
+        // Se chunks=8 mas só tem 3 linhas, alguns ranges serão vazios.
+        // Deve tratar graciosamente.
+        let dir = unique_temp_dir("pp_overpartition");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(&input, "a\nb\nc\n");
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                8,
+                ";",
+                ";",
+                false,
+                r#"[{"in":0,"out":0,"ops":[]}]"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(res[0], 3);
+        assert_eq!(read_file(&output), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn process_parallel_matches_three_step_pipeline_output() {
+        // Paridade: processar via process_parallel_impl deve produzir o MESMO
+        // output que o pipeline antigo (split + chunks + merge). Mesmos input
+        // counts, mesmos output counts, mesmo conteúdo final.
+        let dir_old = unique_temp_dir("parity_old");
+        let dir_new = unique_temp_dir("parity_new");
+        let input_content =
+            "12345678909;Alice\n11111111111;Bob\n12345678909;Carol\n12345678909;Dave\n";
+        let input_old = dir_old.join("in.csv");
+        let input_new = dir_new.join("in.csv");
+        let output_old = dir_old.join("final.csv");
+        let output_new = dir_new.join("out.csv");
+        write_file(&input_old, input_content);
+        write_file(&input_new, input_content);
+
+        let layout =
+            r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"},{"in":1,"out":1,"ops":["uppercase"]}]"#;
+
+        let fp = FileProcessor;
+
+        // Pipeline antigo (3 etapas)
+        fp.split_file_impl(path_str(&input_old), path_str(&dir_old), 3)
+            .unwrap();
+        let old_totals = fp
+            .process_chunks_impl(
+                path_str(&dir_old),
+                3,
+                ";",
+                ";",
+                false,
+                layout,
+                true,
+            )
+            .unwrap();
+        fp.merge_files_impl(path_str(&dir_old), path_str(&output_old), 3)
+            .unwrap();
+
+        // Pipeline novo (1 chamada)
+        let new_totals = fp
+            .process_parallel_impl(
+                path_str(&input_new),
+                path_str(&output_new),
+                3,
+                ";",
+                ";",
+                false,
+                layout,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(old_totals, new_totals);
+        assert_eq!(read_file(&output_old), read_file(&output_new));
     }
 
     // ===========================================================

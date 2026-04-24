@@ -280,9 +280,43 @@ $total = $processor->mergeFiles(
 echo "Arquivo final gerado com $total linhas";
 ```
 
-### `processFile(string $inputPath, string $outputPath, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson): array`
+### `processParallel(string $inputPath, string $outputPath, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true): array`
 
-Versão single-shot que processa um arquivo inteiro (sem split/merge). Útil para arquivos menores ou quando não se deseja paralelizar via arquivos.
+Pipeline completo em uma única chamada: mmap do input, divide em N ranges line-aligned, processa cada range em uma thread rayon (cada uma escrevendo num buffer de memória), concatena os buffers no output final.
+
+É o método **recomendado** para o caso comum. Não cria temp files, não precisa de diretório de trabalho, e faz ~3x menos I/O de disco comparado ao fluxo de 3 chamadas `splitFile` + `processChunks` + `mergeFiles`. Ordem de linhas é preservada porque os buffers são escritos em ordem de chunk.
+
+**Parâmetros:**
+
+- `$inputPath` — caminho absoluto do arquivo CSV de entrada
+- `$outputPath` — caminho absoluto do arquivo CSV final
+- `$chunks` — número de threads/ranges de processamento
+- `$inputDelimiter` / `$outputDelimiter` — ex: `";"`, `","`
+- `$skipHeader` — se `true`, ignora a primeira linha do arquivo (uma única vez, não por chunk)
+- `$columnsJson` — layout JSON (ver seção **Layout**)
+- `$escapeFormulas` — opcional, default `true`. Neutraliza CSV formula injection
+
+**Retorno:** `[input_total, output_total, invalid_total]`.
+
+**Exemplo:**
+
+```php
+$totals = $processor->processParallel(
+    '/var/data/clientes.csv',
+    '/var/data/clientes_normalizados.csv',
+    16,
+    ';',
+    ';',
+    false,
+    $layout
+);
+
+[$in, $out, $invalid] = $totals;
+```
+
+### `processFile(string $inputPath, string $outputPath, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true): array`
+
+Versão single-thread de `processParallel`. Útil para arquivos muito pequenos onde o overhead de splitting supera o ganho de paralelismo, ou quando você quer determinismo exato para debugging.
 
 **Retorno:** `[input_count, output_count, invalid_count]`.
 
@@ -381,10 +415,54 @@ Erros do layout aparecem como exceção PHP antes de qualquer arquivo ser aberto
 
 ## Exemplo completo: pipeline ETL
 
+### Recomendado: `processParallel` (single-call, sem temp dir)
+
 ```php
 <?php
 
 class EtlProcessor
+{
+    private FileProcessor $rust;
+    private int $chunks;
+
+    public function __construct(int $chunks = 16)
+    {
+        $this->rust = new FileProcessor();
+        $this->chunks = $chunks;
+    }
+
+    public function process(string $inputFile, string $outputFile, array $layout): array
+    {
+        $t0 = microtime(true);
+
+        $totals = $this->rust->processParallel(
+            $inputFile,
+            $outputFile,
+            $this->chunks,
+            ';',
+            ';',
+            false,
+            json_encode($layout)
+        );
+
+        return [
+            'input_count' => $totals[0],
+            'output_count' => $totals[1],
+            'invalid_count' => $totals[2],
+            'elapsed_ms' => round((microtime(true) - $t0) * 1000, 2),
+        ];
+    }
+}
+```
+
+### Fluxo de 3 chamadas (quando precisar de checkpoints em disco)
+
+Útil se você quer poder retomar o pipeline depois de um crash, ou inspecionar arquivos intermediários:
+
+```php
+<?php
+
+class EtlProcessorCheckpointed
 {
     private FileProcessor $rust;
     private int $chunks;
