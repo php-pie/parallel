@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use crate::validators::{validate_cnpj, validate_cpf};
+
 #[derive(Clone, Debug)]
 pub enum Operation {
     Trim,
@@ -8,6 +10,37 @@ pub enum Operation {
     Lowercase,
     PadLeft(usize, char),
     StripDdi(String),
+    /// Remove zeros à esquerda. `"0001234"` → `"1234"`, `"0000"` → `""`.
+    RemoveLeadingZeroes,
+    /// Canonicaliza CPF: tira não-dígitos, tira leading zeros, pega os
+    /// últimos 11 dígitos (ou pad à esquerda com `0`), valida. Retorna o
+    /// canônico (11 dígitos) ou `""` se inválido. Alinha com o pipe
+    /// `digits|remove_leading_zeroes|right:11|pad_left:0,11|<validate_cpf>`
+    /// do DataSanitizer PHP.
+    CpfCanonical,
+    /// Canonicaliza CNPJ: mesma lógica, 14 dígitos.
+    CnpjCanonical,
+    /// Detecta e canonicaliza documento brasileiro como CPF OU CNPJ.
+    /// Se >11 dígitos após stripar zeros → tenta CNPJ (14 dig).
+    /// Senão → tenta CPF (11 dig); se falhar, tenta CNPJ (14 dig).
+    /// Retorna canônico válido ou `""`.
+    DocumentCanonical,
+}
+
+/// Pega os últimos `n` chars de `s` (se len >= n) ou left-pad com `'0'`
+/// até `n` chars. Usado pela normalização de documento.
+fn to_n_digits(s: &str, n: usize) -> String {
+    if s.len() >= n {
+        s[s.len() - n..].to_string()
+    } else {
+        let pad = n - s.len();
+        let mut out = String::with_capacity(n);
+        for _ in 0..pad {
+            out.push('0');
+        }
+        out.push_str(s);
+        out
+    }
 }
 
 impl Operation {
@@ -64,6 +97,59 @@ impl Operation {
                 } else {
                     Cow::Borrowed(s)
                 }
+            }
+            Operation::RemoveLeadingZeroes => {
+                let trimmed = s.trim_start_matches('0');
+                if trimmed.len() == s.len() {
+                    Cow::Borrowed(s)
+                } else {
+                    Cow::Borrowed(trimmed)
+                }
+            }
+            Operation::CpfCanonical => {
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                let stripped = digits.trim_start_matches('0');
+                let canonical = to_n_digits(stripped, 11);
+                if validate_cpf(&canonical) {
+                    Cow::Owned(canonical)
+                } else {
+                    Cow::Owned(String::new())
+                }
+            }
+            Operation::CnpjCanonical => {
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                let stripped = digits.trim_start_matches('0');
+                let canonical = to_n_digits(stripped, 14);
+                if validate_cnpj(&canonical) {
+                    Cow::Owned(canonical)
+                } else {
+                    Cow::Owned(String::new())
+                }
+            }
+            Operation::DocumentCanonical => {
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                let stripped = digits.trim_start_matches('0');
+
+                if stripped.len() > 11 {
+                    // >11 dígitos após strip: path direto CNPJ
+                    let canonical = to_n_digits(stripped, 14);
+                    if validate_cnpj(&canonical) {
+                        return Cow::Owned(canonical);
+                    }
+                    return Cow::Owned(String::new());
+                }
+
+                // Primeiro tenta CPF
+                let cpf = to_n_digits(stripped, 11);
+                if validate_cpf(&cpf) {
+                    return Cow::Owned(cpf);
+                }
+                // Fallback CNPJ
+                let cnpj = to_n_digits(stripped, 14);
+                if validate_cnpj(&cnpj) {
+                    return Cow::Owned(cnpj);
+                }
+                Cow::Owned(String::new())
             }
         }
     }
@@ -130,8 +216,12 @@ pub fn parse_op(spec: &str) -> Result<Operation, String> {
                 .ok_or_else(|| "strip_ddi requires prefix: 'strip_ddi:<ddi>'".to_string())?;
             Ok(Operation::StripDdi(ddi.to_string()))
         }
+        "remove_leading_zeroes" => Ok(Operation::RemoveLeadingZeroes),
+        "cpf_canonical" => Ok(Operation::CpfCanonical),
+        "cnpj_canonical" => Ok(Operation::CnpjCanonical),
+        "document_canonical" => Ok(Operation::DocumentCanonical),
         other => Err(format!(
-            "unknown operation '{}'; expected one of: trim, digits_only, uppercase, lowercase, pad_left, strip_ddi",
+            "unknown operation '{}'; expected one of: trim, digits_only, uppercase, lowercase, pad_left, strip_ddi, remove_leading_zeroes, cpf_canonical, cnpj_canonical, document_canonical",
             other
         )),
     }
@@ -288,5 +378,169 @@ mod tests {
         assert!(err.contains("unknown operation"));
         assert!(err.contains("trimm"));
         assert!(parse_op("").is_err());
+    }
+
+    // ===========================================================
+    // remove_leading_zeroes
+    // ===========================================================
+
+    #[test]
+    fn remove_leading_zeroes_strips_prefix() {
+        assert_eq!(Operation::RemoveLeadingZeroes.apply("0001234"), "1234");
+        assert_eq!(Operation::RemoveLeadingZeroes.apply("0"), "");
+        assert_eq!(Operation::RemoveLeadingZeroes.apply("0000"), "");
+    }
+
+    #[test]
+    fn remove_leading_zeroes_noop_when_no_prefix() {
+        let input = "1234";
+        let result = Operation::RemoveLeadingZeroes.apply(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn remove_leading_zeroes_keeps_zeros_in_middle() {
+        assert_eq!(Operation::RemoveLeadingZeroes.apply("10203"), "10203");
+    }
+
+    #[test]
+    fn parse_op_remove_leading_zeroes() {
+        assert!(matches!(
+            parse_op("remove_leading_zeroes"),
+            Ok(Operation::RemoveLeadingZeroes)
+        ));
+    }
+
+    // ===========================================================
+    // cpf_canonical
+    // ===========================================================
+
+    #[test]
+    fn cpf_canonical_accepts_valid_plain() {
+        // 12345678909 é CPF matematicamente válido
+        assert_eq!(Operation::CpfCanonical.apply("12345678909"), "12345678909");
+    }
+
+    #[test]
+    fn cpf_canonical_strips_non_digits() {
+        assert_eq!(
+            Operation::CpfCanonical.apply("123.456.789-09"),
+            "12345678909"
+        );
+    }
+
+    #[test]
+    fn cpf_canonical_strips_leading_zeros_and_repads() {
+        // PHP pipe: digits|remove_leading_zeroes|right:11|pad_left:0,11
+        // "0000012345678909" (15 digits w/ leading zeros)
+        // → strip → "12345678909" → right:11 → "12345678909" → pad → same
+        assert_eq!(
+            Operation::CpfCanonical.apply("0000012345678909"),
+            "12345678909"
+        );
+    }
+
+    #[test]
+    fn cpf_canonical_returns_empty_for_invalid() {
+        assert_eq!(Operation::CpfCanonical.apply("11111111111"), "");
+        assert_eq!(Operation::CpfCanonical.apply("99"), "");
+        assert_eq!(Operation::CpfCanonical.apply(""), "");
+        assert_eq!(Operation::CpfCanonical.apply("abc"), "");
+    }
+
+    #[test]
+    fn parse_op_cpf_canonical() {
+        assert!(matches!(parse_op("cpf_canonical"), Ok(Operation::CpfCanonical)));
+    }
+
+    // ===========================================================
+    // cnpj_canonical
+    // ===========================================================
+
+    #[test]
+    fn cnpj_canonical_accepts_valid() {
+        assert_eq!(
+            Operation::CnpjCanonical.apply("11222333000181"),
+            "11222333000181"
+        );
+    }
+
+    #[test]
+    fn cnpj_canonical_strips_formatting() {
+        assert_eq!(
+            Operation::CnpjCanonical.apply("11.222.333/0001-81"),
+            "11222333000181"
+        );
+    }
+
+    #[test]
+    fn cnpj_canonical_returns_empty_for_invalid() {
+        assert_eq!(Operation::CnpjCanonical.apply("11111111111111"), "");
+        assert_eq!(Operation::CnpjCanonical.apply("12345"), "");
+    }
+
+    #[test]
+    fn parse_op_cnpj_canonical() {
+        assert!(matches!(
+            parse_op("cnpj_canonical"),
+            Ok(Operation::CnpjCanonical)
+        ));
+    }
+
+    // ===========================================================
+    // document_canonical
+    // ===========================================================
+
+    #[test]
+    fn document_canonical_accepts_valid_cpf() {
+        assert_eq!(
+            Operation::DocumentCanonical.apply("12345678909"),
+            "12345678909"
+        );
+        // formatado
+        assert_eq!(
+            Operation::DocumentCanonical.apply("123.456.789-09"),
+            "12345678909"
+        );
+    }
+
+    #[test]
+    fn document_canonical_accepts_valid_cnpj() {
+        assert_eq!(
+            Operation::DocumentCanonical.apply("11222333000181"),
+            "11222333000181"
+        );
+        assert_eq!(
+            Operation::DocumentCanonical.apply("11.222.333/0001-81"),
+            "11222333000181"
+        );
+    }
+
+    #[test]
+    fn document_canonical_empty_when_neither_valid() {
+        assert_eq!(Operation::DocumentCanonical.apply(""), "");
+        assert_eq!(Operation::DocumentCanonical.apply("abc"), "");
+        assert_eq!(Operation::DocumentCanonical.apply("12345"), "");
+        // sequências inválidas
+        assert_eq!(Operation::DocumentCanonical.apply("11111111111"), "");
+        assert_eq!(Operation::DocumentCanonical.apply("11111111111111"), "");
+    }
+
+    #[test]
+    fn document_canonical_handles_leading_zeros() {
+        // CPF válido com zeros à esquerda preservados no input
+        assert_eq!(
+            Operation::DocumentCanonical.apply("0012345678909"),
+            "12345678909"
+        );
+    }
+
+    #[test]
+    fn parse_op_document_canonical() {
+        assert!(matches!(
+            parse_op("document_canonical"),
+            Ok(Operation::DocumentCanonical)
+        ));
     }
 }

@@ -6,6 +6,10 @@ pub enum Validator {
     Email,
     Length(usize, usize),
     Regex(regex::Regex),
+    /// Campo não pode estar em branco. Combina com ops canônicos que
+    /// retornam `""` em caso de falha (ex.: `document_canonical`) para
+    /// dropar a linha inteira quando o campo-chave ficar vazio.
+    NotBlank,
 }
 
 impl Validator {
@@ -20,6 +24,7 @@ impl Validator {
                 count >= *min && count <= *max
             }
             Validator::Regex(re) => re.is_match(s),
+            Validator::NotBlank => !s.is_empty(),
         }
     }
 }
@@ -34,6 +39,7 @@ pub fn parse_validator(spec: &str) -> Result<Validator, String> {
         "phone_br" => Ok(Validator::PhoneBr),
         "cnpj" => Ok(Validator::Cnpj),
         "email" => Ok(Validator::Email),
+        "not_blank" => Ok(Validator::NotBlank),
         "length" => {
             let args = rest.ok_or_else(|| {
                 "length requires args: 'length:<min>:<max>'".to_string()
@@ -61,7 +67,7 @@ pub fn parse_validator(spec: &str) -> Result<Validator, String> {
             Ok(Validator::Regex(re))
         }
         other => Err(format!(
-            "unknown validator '{}'; expected one of: cpf, phone_br, cnpj, email, length, regex",
+            "unknown validator '{}'; expected one of: cpf, phone_br, cnpj, email, length, regex, not_blank",
             other
         )),
     }
@@ -429,5 +435,26 @@ mod tests {
     fn parse_validator_unknown() {
         let err = parse_validator("passport").unwrap_err();
         assert!(err.contains("unknown validator"));
+    }
+
+    // ===========================================================
+    // Validator::NotBlank
+    // ===========================================================
+
+    #[test]
+    fn not_blank_rejects_empty_string() {
+        assert!(!Validator::NotBlank.check(""));
+    }
+
+    #[test]
+    fn not_blank_accepts_non_empty() {
+        assert!(Validator::NotBlank.check("x"));
+        assert!(Validator::NotBlank.check(" "));
+        assert!(Validator::NotBlank.check("12345678909"));
+    }
+
+    #[test]
+    fn parse_validator_not_blank() {
+        assert!(matches!(parse_validator("not_blank"), Ok(Validator::NotBlank)));
     }
 }

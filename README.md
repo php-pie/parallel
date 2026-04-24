@@ -215,7 +215,7 @@ echo "Total de linhas: " . array_sum($counts);
 // Cria /tmp/etl_job_123/input_0.csv até input_15.csv
 ```
 
-### `processChunks(string $dir, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson): array`
+### `processChunks(string $dir, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary'): array`
 
 Processa todos os chunks em paralelo aplicando transformações e validações definidas no layout. Lê `input_N.csv`, gera `output_N.csv` para cada chunk.
 
@@ -280,7 +280,7 @@ $total = $processor->mergeFiles(
 echo "Arquivo final gerado com $total linhas";
 ```
 
-### `processParallel(string $inputPath, string $outputPath, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true): array`
+### `processParallel(string $inputPath, string $outputPath, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary'): array`
 
 Pipeline completo em uma única chamada: mmap do input, divide em N ranges line-aligned, processa cada range em uma thread rayon (cada uma escrevendo num buffer de memória), concatena os buffers no output final.
 
@@ -314,7 +314,7 @@ $totals = $processor->processParallel(
 [$in, $out, $invalid] = $totals;
 ```
 
-### `processFile(string $inputPath, string $outputPath, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true): array`
+### `processFile(string $inputPath, string $outputPath, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary'): array`
 
 Versão single-thread de `processParallel`. Útil para arquivos muito pequenos onde o overhead de splitting supera o ganho de paralelismo, ou quando você quer determinismo exato para debugging.
 
@@ -372,8 +372,14 @@ O parâmetro `$columnsJson` define o pipeline de transformação de cada coluna.
 | `lowercase` | Converte para minúsculas | `"João"` → `"joão"` |
 | `pad_left:N:C` | Preenche à esquerda até N chars com o char C | `"123"` com `pad_left:5:0` → `"00123"` |
 | `strip_ddi:DDI` | Remove o DDI do início da string | `"5511987654321"` com `strip_ddi:55` → `"11987654321"` |
+| `remove_leading_zeroes` | Remove zeros à esquerda | `"0001234"` → `"1234"` |
+| `cpf_canonical` | Canonicaliza como CPF (11 dígitos) e valida. Se inválido, retorna `""` | `"123.456.789-09"` → `"12345678909"` |
+| `cnpj_canonical` | Canonicaliza como CNPJ (14 dígitos) e valida. Se inválido, retorna `""` | `"11.222.333/0001-81"` → `"11222333000181"` |
+| `document_canonical` | Detecta automaticamente CPF ou CNPJ e canonicaliza. Se nenhum dos dois, retorna `""` | `"123.456.789-09"` → `"12345678909"`; `"11222333000181"` → `"11222333000181"` |
 
 As operações são aplicadas **na ordem declarada**. Em `["digits_only", "pad_left:11:0"]`, primeiro remove não-dígitos, depois preenche com zeros.
+
+**Padrão `canonical + not_blank`:** ops terminadas em `_canonical` retornam `""` quando inválidas (campo vira em branco, mas a linha fica). Se o campo é obrigatório (ex: chave primária do registro), combine com o validator `not_blank` — aí a linha inteira é descartada. Ver seção de validadores.
 
 ### Validadores disponíveis (`validate`)
 
@@ -385,8 +391,22 @@ As operações são aplicadas **na ordem declarada**. Em `["digits_only", "pad_l
 | `email` | Heurística: `local@dominio` com ponto no domínio, sem espaços, um único `@` |
 | `length:<min>:<max>` | Contagem de chars (UTF-8, não bytes) no intervalo `[min, max]` |
 | `regex:<padrão>` | Sintaxe regex da crate [`regex`](https://docs.rs/regex/). Compilado uma vez por layout |
+| `not_blank` | Campo não pode estar vazio. Combina com `_canonical` ops para dropar linhas em que o campo-chave ficou vazio após canonicalização |
 
 Se uma coluna com `validate` falhar, a **linha inteira** é descartada e contabilizada em `invalid_count`.
+
+**Campo-chave obrigatório (ex: document).** Para forçar validade de um campo e descartar a linha se inválido, combine op canonical + `not_blank`:
+
+```json
+{
+    "in": 0,
+    "out": 0,
+    "ops": ["document_canonical"],
+    "validate": "not_blank"
+}
+```
+
+Fluxo: `document_canonical` aplica digits_only + remove_leading_zeroes + detecta CPF/CNPJ + valida. Se inválido → `""`. Em seguida `not_blank` vê `""` → dropa a linha inteira. Equivale semanticamente ao pipe `digits|document` do `DataSanitizer` combinado com "document obrigatório".
 
 Exemplos:
 
@@ -737,6 +757,39 @@ $processor->processChunks($dir, $n, ';', ';', false, $layout, false);
 A validação (`validate`) roda sobre o valor **antes** do escape, então CPFs/CNPJs/regex continuam funcionando como esperado — um CPF válido não fica inválido por receber prefixo depois.
 
 Veja [OWASP — CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) para contexto.
+
+### Saída para SQL Server via `bcp`
+
+O `bcp` (Bulk Copy Program do SQL Server) **não implementa RFC 4180** — ele não entende quoting nem escapes. Para gerar CSVs consumíveis por `bcp`, use o parâmetro `$quoteStyle` com valor `"never"` e desligue o escape de fórmulas:
+
+```php
+$processor->processParallel(
+    $inputFile,
+    $outputFile,
+    16,
+    ';', ';',
+    false,
+    $layout,
+    false,      // escape_formulas=false — bcp carregaria o ' literal
+    'never'     // quote_style=never — bcp carregaria as aspas literais
+);
+```
+
+**Valores de `$quoteStyle`:**
+
+| Valor | Comportamento |
+|---|---|
+| `"necessary"` (default) | RFC 4180: quota apenas campos que contenham delimiter, aspas ou newline |
+| `"always"` | Quota todos os campos |
+| `"never"` | Nunca quota. **Requer** que os dados não contenham o delimiter |
+
+**Garantindo o delimiter limpo:** com `"never"`, se algum campo de saída contiver o delimiter configurado, o output fica corrompido (bcp interpretará como fim de coluna). Responsabilidade do layout manter isso fora:
+
+- Campos numéricos (document, phone, cep): `digits_only` já remove qualquer `;`
+- Campos categóricos (record_type, uf): use `constant:X` ou validator `in:...` para restringir a valores conhecidos
+- Campos de texto livre (nome, endereço): se o delimiter puder aparecer, ou (a) mude o delimiter pra `|` ou tab, (b) adicione um op que remova o delimiter antes da saída
+
+Line endings: a saída é sempre `\n`. Use `bcp ... -r "\n"` na invocação.
 
 ---
 

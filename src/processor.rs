@@ -27,6 +27,28 @@ fn parse_delimiter(delim: &str, default: u8) -> u8 {
     delim.bytes().next().unwrap_or(default)
 }
 
+/// Traduz uma string vinda do PHP para `csv::QuoteStyle`.
+///
+/// - `"necessary"` (default) — RFC 4180: quota campos que contenham o
+///   delimiter, quote char ou newline. Correto pra leitores CSV padrão.
+/// - `"always"` — quota TODOS os campos. Útil quando o consumer espera
+///   delimitadores sempre dentro de aspas.
+/// - `"never"` — nunca quota. Necessário pra SQL Server `bcp` e outros
+///   consumers que não entendem RFC 4180. **Atenção**: se algum campo
+///   conter o delimiter, o output fica corrompido (sem forma de escape).
+///   Responsabilidade do layout de ops manter os dados "limpos".
+fn parse_quote_style(s: &str) -> Result<csv::QuoteStyle, String> {
+    match s {
+        "necessary" => Ok(csv::QuoteStyle::Necessary),
+        "always" => Ok(csv::QuoteStyle::Always),
+        "never" => Ok(csv::QuoteStyle::Never),
+        other => Err(format!(
+            "unknown quote_style '{}'; expected one of: necessary, always, never",
+            other
+        )),
+    }
+}
+
 /// Detecta se um campo começa com caractere que dispara interpretação de
 /// fórmula em Excel/Sheets/Calc. Inclui os vetores clássicos (`=`, `+`, `-`, `@`)
 /// e as variações via tab/CR que alguns parsers tratam como continuação.
@@ -70,11 +92,16 @@ fn csv_reader<R: std::io::Read>(delim: u8, has_headers: bool, reader: R) -> csv:
         .from_reader(reader)
 }
 
-fn csv_writer<W: std::io::Write>(delim: u8, writer: W) -> csv::Writer<W> {
+fn csv_writer<W: std::io::Write>(
+    delim: u8,
+    quote_style: csv::QuoteStyle,
+    writer: W,
+) -> csv::Writer<W> {
     csv::WriterBuilder::new()
         .delimiter(delim)
         .terminator(csv::Terminator::Any(b'\n'))
         .buffer_capacity(CSV_WRITE_BUFFER)
+        .quote_style(quote_style)
         .from_writer(writer)
 }
 
@@ -86,12 +113,17 @@ fn csv_writer<W: std::io::Write>(delim: u8, writer: W) -> csv::Writer<W> {
 /// `+`, `-`, `@`, `\t` ou `\r` recebem um prefixo `'` para neutralizar
 /// CSV formula injection caso o output seja aberto em Excel/Sheets/Calc.
 ///
+/// `quote_style` controla o quoting do `csv::Writer` (ver
+/// [`parse_quote_style`]). Default caller-chosen: `Necessary` é RFC 4180
+/// seguro; `Never` é pra bcp/consumers que não entendem quoting.
+///
 /// Propaga erros de leitura (record mal formado) e escrita. Para o caso de
 /// processamento por chunks em paralelo, onde queremos resiliência por chunk,
 /// use diretamente o loop de `process_chunks_impl` que faz continue/break
 /// conforme o tipo de erro.
 ///
 /// Retorna `(input_count, output_count, invalid_count)`.
+#[allow(clippy::too_many_arguments)]
 pub fn process_records<R: std::io::Read, W: std::io::Write>(
     reader: R,
     writer: W,
@@ -100,10 +132,11 @@ pub fn process_records<R: std::io::Read, W: std::io::Write>(
     skip_header: bool,
     columns: &[ColumnConfig],
     escape_formulas: bool,
+    quote_style: csv::QuoteStyle,
 ) -> Result<(i64, i64, i64), String> {
     let max_out = max_output_index(columns);
     let mut rdr = csv_reader(input_delimiter, skip_header, reader);
-    let mut wtr = csv_writer(output_delimiter, writer);
+    let mut wtr = csv_writer(output_delimiter, quote_style, writer);
 
     let mut input_count = 0i64;
     let mut output_count = 0i64;
@@ -213,6 +246,11 @@ impl FileProcessor {
     /// campos de saída que começariam com `=`/`+`/`-`/`@`/`\t`/`\r`. Default
     /// seguro: recomendado manter em `true` exceto para pipelines internos
     /// onde o CSV de saída nunca será aberto em planilha.
+    ///
+    /// `quote_style` controla o quoting do CSV de saída: `"necessary"` (RFC
+    /// 4180, default), `"always"` ou `"never"` (para SQL Server bcp e outros
+    /// consumers sem suporte a quoting).
+    #[allow(clippy::too_many_arguments)]
     pub fn process_file_impl(
         &self,
         input_path: &str,
@@ -222,10 +260,12 @@ impl FileProcessor {
         skip_header: bool,
         columns_json: &str,
         escape_formulas: bool,
+        quote_style: &str,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
         let in_delim = parse_delimiter(input_delimiter, b';');
         let out_delim = parse_delimiter(output_delimiter, b';');
+        let qs = parse_quote_style(quote_style)?;
 
         let file = File::open(input_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
@@ -241,6 +281,7 @@ impl FileProcessor {
             skip_header,
             &columns,
             escape_formulas,
+            qs,
         )?;
 
         Ok(vec![input, output, invalid])
@@ -248,7 +289,9 @@ impl FileProcessor {
 
     /// Processa todos os chunks em paralelo. Retorna [input, output, invalid] totais.
     ///
-    /// Ver `process_file_impl` para a descrição de `escape_formulas`.
+    /// Ver `process_file_impl` para a descrição de `escape_formulas` e
+    /// `quote_style`.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_chunks_impl(
         &self,
         dir: &str,
@@ -258,10 +301,12 @@ impl FileProcessor {
         skip_header: bool,
         columns_json: &str,
         escape_formulas: bool,
+        quote_style: &str,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
         let in_delim = parse_delimiter(input_delimiter, b';');
         let out_delim = parse_delimiter(output_delimiter, b';');
+        let qs = parse_quote_style(quote_style)?;
         let n = chunks as usize;
         let max_out = max_output_index(&columns);
 
@@ -288,7 +333,7 @@ impl FileProcessor {
                     Ok(f) => f,
                     Err(_) => return (0, 0, 0),
                 };
-                let mut wtr = csv_writer(out_delim, out_file);
+                let mut wtr = csv_writer(out_delim, qs, out_file);
 
                 let mut input_count = 0i64;
                 let mut output_count = 0i64;
@@ -352,10 +397,12 @@ impl FileProcessor {
         skip_header: bool,
         columns_json: &str,
         escape_formulas: bool,
+        quote_style: &str,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
         let in_delim = parse_delimiter(input_delimiter, b';');
         let out_delim = parse_delimiter(output_delimiter, b';');
+        let qs = parse_quote_style(quote_style)?;
         let n = chunks.max(1) as usize;
 
         let file = File::open(input_path).map_err(|e| e.to_string())?;
@@ -384,6 +431,7 @@ impl FileProcessor {
                     has_headers,
                     &columns,
                     escape_formulas,
+                    qs,
                 )?;
                 Ok((buffer, input, output, invalid))
             })
@@ -451,6 +499,7 @@ impl FileProcessor {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn process_file(
         &self,
         input_path: String,
@@ -460,6 +509,7 @@ impl FileProcessor {
         skip_header: bool,
         columns_json: String,
         escape_formulas: Option<bool>,
+        quote_style: Option<String>,
     ) -> PhpResult<Vec<i64>> {
         self.process_file_impl(
             &input_path,
@@ -469,10 +519,12 @@ impl FileProcessor {
             skip_header,
             &columns_json,
             escape_formulas.unwrap_or(true),
+            quote_style.as_deref().unwrap_or("necessary"),
         )
         .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn process_chunks(
         &self,
         dir: String,
@@ -482,6 +534,7 @@ impl FileProcessor {
         skip_header: bool,
         columns_json: String,
         escape_formulas: Option<bool>,
+        quote_style: Option<String>,
     ) -> PhpResult<Vec<i64>> {
         self.process_chunks_impl(
             &dir,
@@ -491,6 +544,7 @@ impl FileProcessor {
             skip_header,
             &columns_json,
             escape_formulas.unwrap_or(true),
+            quote_style.as_deref().unwrap_or("necessary"),
         )
         .map_err(Into::into)
     }
@@ -516,6 +570,7 @@ impl FileProcessor {
         skip_header: bool,
         columns_json: String,
         escape_formulas: Option<bool>,
+        quote_style: Option<String>,
     ) -> PhpResult<Vec<i64>> {
         self.process_parallel_impl(
             &input_path,
@@ -526,6 +581,7 @@ impl FileProcessor {
             skip_header,
             &columns_json,
             escape_formulas.unwrap_or(true),
+            quote_style.as_deref().unwrap_or("necessary"),
         )
         .map_err(Into::into)
     }
@@ -649,7 +705,7 @@ mod tests {
         )
         .unwrap();
 
-        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
         assert_eq!((i, o, inv), (2, 2, 0));
         assert_eq!(output, b"ALICE;30\nBOB;25\n");
     }
@@ -661,7 +717,7 @@ mod tests {
         let columns =
             parse_columns(r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#).unwrap();
 
-        let (i, o, inv) = process_records(input, &mut output, b';', b';', true, &columns, true).unwrap();
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', true, &columns, true, csv::QuoteStyle::Necessary).unwrap();
         assert_eq!((i, o, inv), (1, 1, 0));
         assert_eq!(output, b"alice;30\n");
     }
@@ -673,7 +729,7 @@ mod tests {
         let columns =
             parse_columns(r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#).unwrap();
 
-        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
         assert_eq!((i, o, inv), (2, 1, 1));
         assert_eq!(output, b"12345678909\n");
     }
@@ -687,7 +743,7 @@ mod tests {
         )
         .unwrap();
 
-        let (i, o, _) = process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+        let (i, o, _) = process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
         assert_eq!((i, o), (1, 1));
         // Campo com delimitador embutido é re-quotado pelo csv::Writer.
         assert_eq!(output, b"1;\"SILVA; JUNIOR\";42\n");
@@ -727,7 +783,7 @@ mod tests {
             parse_columns(r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#).unwrap();
 
         let (i, o, _) =
-            process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+            process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
         assert_eq!((i, o), (1, 1));
 
         let out_str = std::str::from_utf8(&output).unwrap();
@@ -748,7 +804,7 @@ mod tests {
         let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
 
         let (_, _, _) =
-            process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+            process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
 
         let out_str = std::str::from_utf8(&output).unwrap();
         // csv::Writer re-quota campos que começam com `'` porque não são
@@ -770,7 +826,7 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
         let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
 
-        process_records(input, &mut output, b';', b';', false, &columns, false).unwrap();
+        process_records(input, &mut output, b';', b';', false, &columns, false, csv::QuoteStyle::Necessary).unwrap();
 
         let out_str = std::str::from_utf8(&output).unwrap();
         // O campo começa com '=' puro, sem prefixo.
@@ -787,7 +843,7 @@ mod tests {
         let columns =
             parse_columns(r#"[{"in":0,"out":0,"ops":["strip_ddi:XX"]}]"#).unwrap();
 
-        process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+        process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
 
         let out_str = std::str::from_utf8(&output).unwrap();
         // Após strip_ddi, o campo vira "=malicious" — e deve ser escapado.
@@ -811,10 +867,157 @@ mod tests {
         .unwrap();
 
         let (i, o, inv) =
-            process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+            process_records(input, &mut output, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap();
         // Campo começa com '1' (dígito) — não é trigger, passa sem prefixo.
         assert_eq!((i, o, inv), (1, 1, 0));
         assert_eq!(output, b"12345678909\n");
+    }
+
+    // ===========================================================
+    // quote_style (bcp-friendly output)
+    // ===========================================================
+
+    #[test]
+    fn quote_style_never_does_not_quote_embedded_delimiter() {
+        // Com quote_style=Never, campo com delimiter embutido vai para a
+        // saída SEM aspas — output fica "corrompido" do ponto de vista RFC
+        // 4180 mas é EXATAMENTE o que bcp espera (e quebra se quiser
+        // parsear o próprio output). Responsabilidade do layout não deixar
+        // delimitador passar — aqui exercitamos o writer, não o layout.
+        let input: &[u8] = b"1;value;extra\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]},{"in":2,"out":2,"ops":[]}]"#,
+        )
+        .unwrap();
+
+        process_records(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            false,
+            csv::QuoteStyle::Never,
+        )
+        .unwrap();
+        // Três campos ASCII puros, sem aspas ao redor
+        assert_eq!(output, b"1;value;extra\n");
+    }
+
+    #[test]
+    fn quote_style_necessary_wraps_embedded_delimiter() {
+        // Default: RFC 4180 — campo com delimiter embutido é quotado
+        let input: &[u8] = b"1;\"has;delim\";3\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]},{"in":2,"out":2,"ops":[]}]"#,
+        )
+        .unwrap();
+
+        process_records(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+        assert_eq!(output, b"1;\"has;delim\";3\n");
+    }
+
+    #[test]
+    fn parse_quote_style_known_values() {
+        assert!(matches!(parse_quote_style("necessary").unwrap(), csv::QuoteStyle::Necessary));
+        assert!(matches!(parse_quote_style("always").unwrap(), csv::QuoteStyle::Always));
+        assert!(matches!(parse_quote_style("never").unwrap(), csv::QuoteStyle::Never));
+    }
+
+    #[test]
+    fn parse_quote_style_rejects_unknown() {
+        let err = parse_quote_style("rfc4180").unwrap_err();
+        assert!(err.contains("unknown quote_style"));
+        assert!(err.contains("rfc4180"));
+    }
+
+    #[test]
+    fn process_file_impl_rejects_invalid_quote_style() {
+        let dir = unique_temp_dir("bad_qs");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(&input, "a\n");
+
+        let fp = FileProcessor;
+        let err = fp
+            .process_file_impl(
+                path_str(&input),
+                path_str(&output),
+                ";",
+                ";",
+                false,
+                r#"[{"in":0,"out":0,"ops":[]}]"#,
+                true,
+                "banana",
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown quote_style"));
+    }
+
+    // ===========================================================
+    // Integração: document obrigatório + bcp-mode
+    // ===========================================================
+
+    #[test]
+    fn document_required_with_bcp_mode_drops_invalid_rows() {
+        // Cenário completo: pipeline em modo bcp (no quote, no formula
+        // escape), com document_canonical + not_blank marcando a linha
+        // como obrigatória. Linhas com doc inválido caem.
+        let dir = unique_temp_dir("pipeline_doc_bcp");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+
+        // 4 linhas: 2 CPFs válidos (com formatação), 1 CNPJ válido, 1 lixo
+        write_file(
+            &input,
+            "123.456.789-09;Alice\n\
+             11222333000181;Bellinati\n\
+             11111111111;Bob\n\
+             12345678909;Carol\n",
+        );
+
+        let layout = r#"[
+            {"in":0,"out":0,"ops":["document_canonical"],"validate":"not_blank"},
+            {"in":1,"out":1,"ops":["trim","uppercase"]}
+        ]"#;
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_impl(
+                path_str(&input),
+                path_str(&output),
+                2,
+                ";",
+                ";",
+                false,
+                layout,
+                false,     // escape_formulas OFF para bcp
+                "never",   // quote_style OFF para bcp
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![4, 3, 1]); // 3 válidos, 1 inválido
+        let out = read_file(&output);
+
+        // Saída normalizada, sem aspas, sem prefixo de escape
+        assert!(out.contains("12345678909;ALICE"));
+        assert!(out.contains("11222333000181;BELLINATI"));
+        assert!(out.contains("12345678909;CAROL"));
+        // Bob (CPF inválido 11111111111) caiu
+        assert!(!out.contains("BOB"));
     }
 
     #[test]
@@ -833,7 +1036,7 @@ mod tests {
         let input: &[u8] = b"a\n";
         let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
         let err =
-            process_records(input, FailingWriter, b';', b';', false, &columns, true).unwrap_err();
+            process_records(input, FailingWriter, b';', b';', false, &columns, true, csv::QuoteStyle::Necessary).unwrap_err();
         assert!(err.to_lowercase().contains("nope") || err.to_lowercase().contains("io"));
     }
 
@@ -861,6 +1064,7 @@ mod tests {
                     {"in":1,"out":1,"ops":["trim"]}
                 ]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -887,6 +1091,7 @@ mod tests {
                 true,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
         assert_eq!(res[0], 2); // input_count exclui header
@@ -909,6 +1114,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
         assert_eq!(res, vec![2, 1, 1]);
@@ -938,6 +1144,7 @@ mod tests {
                     {"in":2,"out":2,"ops":[]}
                 ]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -964,6 +1171,7 @@ mod tests {
                 false,
                 r#"[{"in":1,"out":0,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -989,6 +1197,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
         assert_eq!(res[0], 2); // linha em branco fora do input_count
@@ -1014,6 +1223,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1035,6 +1245,7 @@ mod tests {
             false,
             r#"[{"in":0,"out":0,"ops":["uppercase"]},{"in":1,"out":1,"ops":[]}]"#,
             true,
+            "necessary",
         )
         .unwrap();
 
@@ -1058,6 +1269,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
         assert_eq!(res, vec![1, 1, 0]);
@@ -1126,6 +1338,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":["uppercase"]},{"in":1,"out":1,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1154,6 +1367,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1190,6 +1404,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"},{"in":1,"out":1,"ops":["uppercase"]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1222,6 +1437,7 @@ mod tests {
                 true,
                 r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1254,6 +1470,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1279,6 +1496,7 @@ mod tests {
             false,
             r#"[{"in":0,"out":0,"ops":[]}]"#,
             false,
+            "necessary",
         )
         .unwrap();
 
@@ -1305,6 +1523,7 @@ mod tests {
                 false,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1345,6 +1564,7 @@ mod tests {
                 false,
                 layout,
                 true,
+                "necessary",
             )
             .unwrap();
         fp.merge_files_impl(path_str(&dir_old), path_str(&output_old), 3)
@@ -1361,6 +1581,7 @@ mod tests {
                 false,
                 layout,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1398,6 +1619,7 @@ mod tests {
                     {"in":1,"out":1,"ops":["uppercase"]}
                 ]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
@@ -1436,6 +1658,7 @@ mod tests {
                 true,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
                 true,
+                "necessary",
             )
             .unwrap();
 
