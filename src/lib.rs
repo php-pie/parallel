@@ -363,6 +363,65 @@ pub fn parse_columns(json: &str) -> Result<Vec<ColumnConfig>, String> {
 }
 
 // ==========================================================
+// Helpers CSV (file-local)
+// ==========================================================
+
+const CSV_WRITE_BUFFER: usize = 1024 * 1024;
+
+fn max_output_index(columns: &[ColumnConfig]) -> usize {
+    columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1
+}
+
+fn parse_delimiter(delim: &str, default: u8) -> u8 {
+    delim.bytes().next().unwrap_or(default)
+}
+
+fn csv_reader<R: std::io::Read>(delim: u8, has_headers: bool, reader: R) -> csv::Reader<R> {
+    csv::ReaderBuilder::new()
+        .delimiter(delim)
+        .has_headers(has_headers)
+        .flexible(true)
+        .from_reader(reader)
+}
+
+fn csv_writer<W: std::io::Write>(delim: u8, writer: W) -> csv::Writer<W> {
+    csv::WriterBuilder::new()
+        .delimiter(delim)
+        .terminator(csv::Terminator::Any(b'\n'))
+        .buffer_capacity(CSV_WRITE_BUFFER)
+        .from_writer(writer)
+}
+
+/// Aplica o layout numa record e escreve a saída se for válida.
+/// Retorna `Ok(true)` se a linha foi escrita, `Ok(false)` se foi descartada
+/// por um validator, e `Err` apenas se o writer CSV falhar.
+fn transform_and_write<W: std::io::Write>(
+    record: &csv::StringRecord,
+    columns: &[ColumnConfig],
+    out_row: &mut [String],
+    wtr: &mut csv::Writer<W>,
+) -> csv::Result<bool> {
+    for slot in out_row.iter_mut() {
+        slot.clear();
+    }
+    for col in columns {
+        let val = record.get(col.input_index).unwrap_or("");
+        let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
+        for op in &col.ops {
+            transformed = apply_op(op, transformed);
+        }
+        if let Some(v) = &col.validate {
+            if !v.check(&transformed) {
+                return Ok(false);
+            }
+        }
+        out_row[col.output_index].push_str(&transformed);
+    }
+    wtr.write_record(out_row.iter())?;
+    Ok(true)
+}
+
+// ==========================================================
 // Lógica pura (sempre disponível, testável sem PHP runtime)
 // ==========================================================
 
@@ -425,25 +484,17 @@ impl FileProcessor {
         columns_json: &str,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
-        let in_delim = input_delimiter.bytes().next().unwrap_or(b';');
-        let out_delim = output_delimiter.bytes().next().unwrap_or(b';');
-        let max_out = columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1;
+        let in_delim = parse_delimiter(input_delimiter, b';');
+        let out_delim = parse_delimiter(output_delimiter, b';');
+        let max_out = max_output_index(&columns);
 
         let file = File::open(input_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
         let data: &[u8] = &mmap;
 
-        let mut rdr = csv::ReaderBuilder::new()
-            .delimiter(in_delim)
-            .has_headers(skip_header)
-            .flexible(true)
-            .from_reader(data);
-
+        let mut rdr = csv_reader(in_delim, skip_header, data);
         let out_file = File::create(output_path).map_err(|e| e.to_string())?;
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(out_delim)
-            .terminator(csv::Terminator::Any(b'\n'))
-            .from_writer(out_file);
+        let mut wtr = csv_writer(out_delim, out_file);
 
         let mut input_count = 0i64;
         let mut output_count = 0i64;
@@ -452,26 +503,9 @@ impl FileProcessor {
         for result in rdr.records() {
             let record = result.map_err(|e| e.to_string())?;
             input_count += 1;
-            for slot in out_row.iter_mut() {
-                slot.clear();
-            }
-            let mut valid = true;
-            for col in &columns {
-                let val = record.get(col.input_index).unwrap_or("");
-                let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
-                for op in &col.ops {
-                    transformed = apply_op(op, transformed);
-                }
-                if let Some(v) = &col.validate {
-                    if !v.check(&transformed) {
-                        valid = false;
-                        break;
-                    }
-                }
-                out_row[col.output_index].push_str(&transformed);
-            }
-            if valid {
-                wtr.write_record(&out_row).map_err(|e| e.to_string())?;
+            let written = transform_and_write(&record, &columns, &mut out_row, &mut wtr)
+                .map_err(|e| e.to_string())?;
+            if written {
                 output_count += 1;
             }
         }
@@ -491,10 +525,10 @@ impl FileProcessor {
         columns_json: &str,
     ) -> Result<Vec<i64>, String> {
         let columns = parse_columns(columns_json)?;
-        let in_delim = input_delimiter.bytes().next().unwrap_or(b';');
-        let out_delim = output_delimiter.bytes().next().unwrap_or(b';');
+        let in_delim = parse_delimiter(input_delimiter, b';');
+        let out_delim = parse_delimiter(output_delimiter, b';');
         let n = chunks as usize;
-        let max_out = columns.iter().map(|c| c.output_index).max().unwrap_or(0) + 1;
+        let max_out = max_output_index(&columns);
 
         let results: Vec<(i64, i64, i64)> = (0..n)
             .into_par_iter()
@@ -513,21 +547,13 @@ impl FileProcessor {
                 let data: &[u8] = &mmap;
 
                 let has_headers = skip_header && i == 0;
-                let mut rdr = csv::ReaderBuilder::new()
-                    .delimiter(in_delim)
-                    .has_headers(has_headers)
-                    .flexible(true)
-                    .from_reader(data);
+                let mut rdr = csv_reader(in_delim, has_headers, data);
 
                 let out_file = match File::create(&out_path) {
                     Ok(f) => f,
                     Err(_) => return (0, 0, 0),
                 };
-                let mut wtr = csv::WriterBuilder::new()
-                    .delimiter(out_delim)
-                    .terminator(csv::Terminator::Any(b'\n'))
-                    .buffer_capacity(1024 * 1024)
-                    .from_writer(out_file);
+                let mut wtr = csv_writer(out_delim, out_file);
 
                 let mut input_count = 0i64;
                 let mut output_count = 0i64;
@@ -539,31 +565,11 @@ impl FileProcessor {
                         Err(_) => continue,
                     };
                     input_count += 1;
-                    for slot in out_row.iter_mut() {
-                        slot.clear();
+                    match transform_and_write(&record, &columns, &mut out_row, &mut wtr) {
+                        Ok(true) => output_count += 1,
+                        Ok(false) => {} // descartada por validator
+                        Err(_) => break, // falha ao escrever
                     }
-                    let mut valid = true;
-                    for col in &columns {
-                        let val = record.get(col.input_index).unwrap_or("");
-                        let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
-                        for op in &col.ops {
-                            transformed = apply_op(op, transformed);
-                        }
-                        if let Some(v) = &col.validate {
-                            if !v.check(&transformed) {
-                                valid = false;
-                                break;
-                            }
-                        }
-                        out_row[col.output_index].push_str(&transformed);
-                    }
-                    if !valid {
-                        continue;
-                    }
-                    if wtr.write_record(&out_row).is_err() {
-                        break;
-                    }
-                    output_count += 1;
                 }
                 let _ = wtr.flush();
 
