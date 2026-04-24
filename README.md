@@ -314,6 +314,88 @@ $totals = $processor->processParallel(
 [$in, $out, $invalid] = $totals;
 ```
 
+### `processParallelDenormalize(string $inputPath, string $outputPath, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, int $staticCols, int $groupSize, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary'): array`
+
+Variante de `processParallel` com **row fan-out**: cada linha de entrada com formato desnormalizado (prefixo estático + N grupos de colunas) vira múltiplas linhas de saída, uma por grupo. Pipeline paralelo via mmap + rayon, sem temp files.
+
+**Formato do input esperado:** `<S colunas estáticas> + <M grupos de G colunas cada>`. Exemplo com `staticCols=1, groupSize=2`:
+
+```
+Input  (doc + 3 pares ddd/phone):
+  33176825404;82;987148038;82;987432606;82;987694281
+
+Output (1 linha por grupo, prefixo replicado):
+  33176825404;82;987148038
+  33176825404;82;987432606
+  33176825404;82;987694281
+```
+
+**Parâmetros:**
+
+- `$inputPath`, `$outputPath` — caminhos absolutos
+- `$chunks` — número de threads paralelas
+- `$inputDelimiter`, `$outputDelimiter`
+- `$skipHeader` — pula a primeira linha do input (só o primeiro chunk)
+- `$staticCols` — quantas colunas no início do input são **estáticas** (replicadas em cada linha de saída). No exemplo, 1 (document)
+- `$groupSize` — tamanho de cada grupo que se repete. No exemplo, 2 (ddd + phone)
+- `$columnsJson` — layout de **uma linha de saída normalizada**. Ver seção "Layout em modo denormalize"
+- `$escapeFormulas`, `$quoteStyle` — idênticos a `processParallel`
+
+**Retorno:** `[input_rows, output_rows, invalid_rows]`:
+
+- `input_rows` — linhas lidas do arquivo de entrada
+- `output_rows` — linhas efetivamente escritas no arquivo de saída (após fan-out + validação)
+- `invalid_rows` — tentativas de saída (1 por grupo) dropadas por algum `validate`
+
+### Layout em modo denormalize
+
+Em `processParallelDenormalize`, os índices `in` do layout se referem a uma **linha virtual** de largura `staticCols + groupSize`, **não** ao arquivo de entrada bruto.
+
+Continuando o exemplo acima (`staticCols=1, groupSize=2`):
+
+| `in` virtual | Mapeia para input bruto | Semântica |
+|---|---|---|
+| `0` | coluna 0 (sempre) | document (estática) |
+| `1` | coluna `1 + 2*i` | ddd do grupo i |
+| `2` | coluna `2 + 2*i` | phone do grupo i |
+
+A extensão itera `i = 0, 1, 2, ...` (quantos grupos completos existirem) e aplica o layout uma vez por grupo.
+
+**Edge cases:**
+
+- Linha com menos colunas que `staticCols` → pulada silenciosamente (zero saídas)
+- Grupo parcial no fim (ex.: sobrou 1 coluna com `groupSize=2`) → ignora o lixo, emite apenas os grupos completos
+- `in` maior que `staticCols + groupSize - 1` → **erro** no parse (bounds check antes de abrir o arquivo)
+- Validadores rodam **por linha de saída**: uma combinação `(doc, dddN, phoneN)` pode ser inválida enquanto outra `(doc, dddM, phoneM)` do mesmo doc é válida — ambos casos tratados corretamente
+
+**Exemplo completo (caso real: document + múltiplos DDD/phone):**
+
+```php
+$processor = new FileProcessor();
+
+$layout = json_encode([
+    ['in' => 0, 'out' => 0, 'ops' => ['digits_only'], 'validate' => 'document'],
+    ['in' => 1, 'out' => 1, 'ops' => ['digits_only'], 'validate' => 'area_code'],
+    ['in' => 2, 'out' => 2, 'ops' => ['digits_only'], 'validate' => 'phone'],
+]);
+
+$totals = $processor->processParallelDenormalize(
+    'entrada.csv',     // ex: 33176825404;82;987148038;82;987432606;82;987694281
+    'saida.csv',       // ex: 33176825404;82;987148038 (1 linha por grupo)
+    16,
+    ';', ';',
+    false,
+    1,                 // staticCols = 1 (document)
+    2,                 // groupSize = 2 (ddd + phone por grupo)
+    $layout,
+    false,             // escape_formulas OFF (bcp)
+    'never'            // quote_style OFF (bcp)
+);
+
+[$in, $out, $invalid] = $totals;
+echo "Entrada: $in linhas | Saída: $out linhas | Dropadas: $invalid\n";
+```
+
 ### `processFile(string $inputPath, string $outputPath, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary'): array`
 
 Versão single-thread de `processParallel`. Útil para arquivos muito pequenos onde o overhead de splitting supera o ganho de paralelismo, ou quando você quer determinismo exato para debugging.
@@ -477,6 +559,83 @@ class EtlProcessor
     }
 }
 ```
+
+### Row fan-out: desnormalizar um CSV wide em narrow
+
+Padrão comum em pipelines ETL: o arquivo de entrada tem o documento + múltiplos pares (DDD, phone) na mesma linha, e o consumidor (ex: carga bcp no SQL Server) precisa receber uma linha por par, com o documento replicado.
+
+**Input** (cada linha traz 1 doc + N pares DDD/phone):
+```
+33176825404;82;987148038;82;987432606;82;987694281;82;988189515
+33176841000;47;984192969;47;996592586
+33176906315;74;999659384;75;998779719;85;987348663;98;984144354
+```
+
+**Output esperado** (1 linha por par, doc replicado):
+```
+33176825404;82;987148038
+33176825404;82;987432606
+33176825404;82;987694281
+33176825404;82;988189515
+33176841000;47;984192969
+33176841000;47;996592586
+33176906315;74;999659384
+33176906315;75;998779719
+33176906315;85;987348663
+33176906315;98;984144354
+```
+
+**Código PHP:**
+
+```php
+<?php
+
+class DenormalizePhoneRecords
+{
+    public function run(string $inputFile, string $outputFile, int $chunks = 16): array
+    {
+        $fp = new FileProcessor();
+
+        // Layout descreve UMA linha de saída (doc, ddd, phone).
+        // Em modo denormalize, `in` é o índice da linha virtual de tamanho
+        // staticCols + groupSize (aqui: 1 + 2 = 3).
+        $layout = json_encode([
+            ['in' => 0, 'out' => 0, 'ops' => ['digits_only'], 'validate' => 'document'],
+            ['in' => 1, 'out' => 1, 'ops' => ['digits_only'], 'validate' => 'area_code'],
+            ['in' => 2, 'out' => 2, 'ops' => ['digits_only'], 'validate' => 'phone'],
+        ]);
+
+        $t0 = microtime(true);
+        $totals = $fp->processParallelDenormalize(
+            $inputFile,
+            $outputFile,
+            $chunks,
+            ';', ';',
+            false,
+            1,            // 1 coluna estática (document)
+            2,            // grupos de 2 colunas (ddd, phone)
+            $layout,
+            false,        // escape_formulas=false → bcp
+            'never'       // quote_style=never → bcp
+        );
+
+        return [
+            'input_rows'   => $totals[0],
+            'output_rows'  => $totals[1],
+            'invalid_rows' => $totals[2],
+            'elapsed_ms'   => round((microtime(true) - $t0) * 1000, 2),
+        ];
+    }
+}
+
+$result = (new DenormalizePhoneRecords())->run(
+    '/var/data/wide.csv',
+    '/var/data/normalized.csv'
+);
+print_r($result);
+```
+
+**Saída esperada:** `invalid_rows` conta tentativas de saída (1 por grupo do input) dropadas por algum validator — ex: um grupo com DDD inválido é dropado mesmo que outros grupos do mesmo documento sejam válidos.
 
 ### Fluxo de 3 chamadas (quando precisar de checkpoints em disco)
 

@@ -105,6 +105,138 @@ fn csv_writer<W: std::io::Write>(
         .from_writer(writer)
 }
 
+/// Processa records **com fan-out** ("denormalize"): cada linha de entrada
+/// com formato `<S colunas estáticas> + <repetições de G colunas>` vira
+/// múltiplas linhas de saída, uma por grupo.
+///
+/// Exemplo com `static_cols=1, group_size=2`:
+/// ```text
+/// input:   doc ; ddd1 ; ph1 ; ddd2 ; ph2 ; ddd3 ; ph3
+/// output:  doc ; ddd1 ; ph1
+///          doc ; ddd2 ; ph2
+///          doc ; ddd3 ; ph3
+/// ```
+///
+/// O layout `columns` descreve **uma linha normalizada de saída**. Os `in`
+/// dos `ColumnConfig` são índices de uma "linha virtual" de largura
+/// `static_cols + group_size`:
+/// - `in < static_cols` → pega da coluna estática do input
+/// - `in >= static_cols` → pega da posição correspondente DENTRO do grupo atual
+///
+/// Cada grupo vira uma tentativa de linha de saída; validators rodam por
+/// linha de saída. Uma combinação `(doc, dddN, phN)` pode ser inválida
+/// enquanto outra `(doc, dddM, phM)` do mesmo doc é válida — ambos casos
+/// são tratados corretamente.
+///
+/// **Edge cases:**
+/// - Linha com menos de `static_cols` colunas → pulada (zero saídas).
+/// - Grupo parcial no final (ex.: sobrou 1 coluna com `group_size=2`) →
+///   ignora o lixo e emite só os grupos completos.
+/// - `group_size=0` retorna erro de validação de parâmetros.
+///
+/// Retorna `(input_count, output_count, invalid_count)`:
+/// - `input_count` — linhas lidas do input
+/// - `output_count` — linhas de saída efetivamente escritas
+/// - `invalid_count` — tentativas de saída (1 por grupo) dropadas por
+///   validator
+#[allow(clippy::too_many_arguments)]
+pub fn process_records_denormalize<R: std::io::Read, W: std::io::Write>(
+    reader: R,
+    writer: W,
+    input_delimiter: u8,
+    output_delimiter: u8,
+    skip_header: bool,
+    columns: &[ColumnConfig],
+    static_cols: usize,
+    group_size: usize,
+    escape_formulas: bool,
+    quote_style: csv::QuoteStyle,
+) -> Result<(i64, i64, i64), String> {
+    if group_size == 0 {
+        return Err("group_size must be >= 1".to_string());
+    }
+    // Valida que o layout não referencia colunas fora da linha virtual.
+    let virtual_width = static_cols + group_size;
+    for (idx, col) in columns.iter().enumerate() {
+        if col.input_index >= virtual_width {
+            return Err(format!(
+                "column {}: input_index {} exceeds virtual row width {} (static_cols={} + group_size={})",
+                idx, col.input_index, virtual_width, static_cols, group_size
+            ));
+        }
+    }
+
+    let max_out = max_output_index(columns);
+    let mut rdr = csv_reader(input_delimiter, skip_header, reader);
+    let mut wtr = csv_writer(output_delimiter, quote_style, writer);
+
+    let mut input_count = 0i64;
+    let mut output_count = 0i64;
+    let mut invalid_count = 0i64;
+    let mut out_row: Vec<String> = vec![String::new(); max_out];
+
+    for result in rdr.records() {
+        let record = result.map_err(|e| e.to_string())?;
+        input_count += 1;
+
+        let num_cols = record.len();
+        if num_cols < static_cols {
+            continue; // não cabe nem o prefixo
+        }
+        let num_groups = (num_cols - static_cols) / group_size;
+
+        for group_idx in 0..num_groups {
+            // Reset dos slots da linha de saída
+            for slot in out_row.iter_mut() {
+                slot.clear();
+            }
+
+            let mut row_valid = true;
+            for col in columns {
+                let vi = col.input_index;
+                let actual_idx = if vi < static_cols {
+                    vi
+                } else {
+                    static_cols + group_idx * group_size + (vi - static_cols)
+                };
+                let val = record.get(actual_idx).unwrap_or("");
+
+                let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
+                for op in &col.ops {
+                    transformed = apply_op(op, transformed);
+                }
+                if let Some(v) = &col.validate {
+                    if !v.check(&transformed) {
+                        row_valid = false;
+                        break;
+                    }
+                }
+                out_row[col.output_index].push_str(&transformed);
+            }
+
+            if !row_valid {
+                invalid_count += 1;
+                continue;
+            }
+
+            if escape_formulas {
+                for slot in out_row.iter_mut() {
+                    if needs_formula_escape(slot) {
+                        slot.insert(0, '\'');
+                    }
+                }
+            }
+
+            wtr.write_record(out_row.iter())
+                .map_err(|e| e.to_string())?;
+            output_count += 1;
+        }
+    }
+    wtr.flush().map_err(|e| e.to_string())?;
+
+    Ok((input_count, output_count, invalid_count))
+}
+
 /// Processa todos os records de `reader` aplicando `columns` e escreve em
 /// `writer`. Genérico em `Read`/`Write` — qualquer fonte que implemente
 /// `Read` serve (arquivo, `&[u8]`, `Cursor<Vec<u8>>`, socket).
@@ -456,6 +588,103 @@ impl FileProcessor {
         Ok(vec![totals.0, totals.1, totals.2])
     }
 
+    /// Variante de `process_parallel_impl` com **fan-out**: cada linha de
+    /// input desnormaliza em N linhas de output.
+    ///
+    /// Formato do input esperado: `<S colunas estáticas> + <M grupos de G colunas>`.
+    /// Cada grupo vira uma linha de saída composta por `<estáticas> + <grupo>`.
+    ///
+    /// `columns_json` descreve **uma linha normalizada de saída** — os `in`
+    /// dos columns são índices da linha virtual de tamanho
+    /// `static_cols + group_size`, não do arquivo de entrada bruto. Ver
+    /// [`process_records_denormalize`] para detalhes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_parallel_denormalize_impl(
+        &self,
+        input_path: &str,
+        output_path: &str,
+        chunks: i64,
+        input_delimiter: &str,
+        output_delimiter: &str,
+        skip_header: bool,
+        static_cols: i64,
+        group_size: i64,
+        columns_json: &str,
+        escape_formulas: bool,
+        quote_style: &str,
+    ) -> Result<Vec<i64>, String> {
+        if static_cols < 0 {
+            return Err("static_cols must be >= 0".to_string());
+        }
+        if group_size <= 0 {
+            return Err("group_size must be >= 1".to_string());
+        }
+        let columns = parse_columns(columns_json)?;
+        let in_delim = parse_delimiter(input_delimiter, b';');
+        let out_delim = parse_delimiter(output_delimiter, b';');
+        let qs = parse_quote_style(quote_style)?;
+        let n = chunks.max(1) as usize;
+        let static_cols_u = static_cols as usize;
+        let group_size_u = group_size as usize;
+
+        // Valida bounds antes de abrir o arquivo
+        let virtual_width = static_cols_u + group_size_u;
+        for (idx, col) in columns.iter().enumerate() {
+            if col.input_index >= virtual_width {
+                return Err(format!(
+                    "column {}: input_index {} exceeds virtual row width {} (static_cols={} + group_size={})",
+                    idx, col.input_index, virtual_width, static_cols_u, group_size_u
+                ));
+            }
+        }
+
+        let file = File::open(input_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
+        let data: &[u8] = &mmap;
+
+        let boundaries = compute_line_boundaries(data, n);
+
+        // Cada thread processa seu range. Output pode ser MAIOR que input
+        // (fan-out expande 1 linha em N), então alocamos capacidade maior.
+        let results: Result<Vec<(Vec<u8>, i64, i64, i64)>, String> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<(Vec<u8>, i64, i64, i64), String> {
+                let start = boundaries[i];
+                let end = boundaries[i + 1];
+                let slice = &data[start..end];
+                let has_headers = skip_header && i == 0;
+                let mut buffer: Vec<u8> = Vec::with_capacity(slice.len() * 2);
+                let (input, output, invalid) = process_records_denormalize(
+                    slice,
+                    &mut buffer,
+                    in_delim,
+                    out_delim,
+                    has_headers,
+                    &columns,
+                    static_cols_u,
+                    group_size_u,
+                    escape_formulas,
+                    qs,
+                )?;
+                Ok((buffer, input, output, invalid))
+            })
+            .collect();
+        let results = results?;
+
+        let out_file = File::create(output_path).map_err(|e| e.to_string())?;
+        let mut writer = std::io::BufWriter::new(out_file);
+        let mut totals = (0i64, 0i64, 0i64);
+        for (buffer, input, output, invalid) in results {
+            writer.write_all(&buffer).map_err(|e| e.to_string())?;
+            totals.0 += input;
+            totals.1 += output;
+            totals.2 += invalid;
+        }
+        writer.flush().map_err(|e| e.to_string())?;
+
+        Ok(vec![totals.0, totals.1, totals.2])
+    }
+
     /// Concatena arquivos output_*.csv em um único arquivo final.
     pub fn merge_files_impl(
         &self,
@@ -579,6 +808,37 @@ impl FileProcessor {
             &input_delimiter,
             &output_delimiter,
             skip_header,
+            &columns_json,
+            escape_formulas.unwrap_or(true),
+            quote_style.as_deref().unwrap_or("necessary"),
+        )
+        .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_parallel_denormalize(
+        &self,
+        input_path: String,
+        output_path: String,
+        chunks: i64,
+        input_delimiter: String,
+        output_delimiter: String,
+        skip_header: bool,
+        static_cols: i64,
+        group_size: i64,
+        columns_json: String,
+        escape_formulas: Option<bool>,
+        quote_style: Option<String>,
+    ) -> PhpResult<Vec<i64>> {
+        self.process_parallel_denormalize_impl(
+            &input_path,
+            &output_path,
+            chunks,
+            &input_delimiter,
+            &output_delimiter,
+            skip_header,
+            static_cols,
+            group_size,
             &columns_json,
             escape_formulas.unwrap_or(true),
             quote_style.as_deref().unwrap_or("necessary"),
@@ -1587,6 +1847,492 @@ mod tests {
 
         assert_eq!(old_totals, new_totals);
         assert_eq!(read_file(&output_old), read_file(&output_new));
+    }
+
+    // ===========================================================
+    // process_records_denormalize (fan-out in-memory)
+    // ===========================================================
+
+    #[test]
+    fn denormalize_basic_fan_out() {
+        // 1 estática (doc) + grupos de 2 (ddd, phone). 3 grupos por linha.
+        let input: &[u8] = b"33176825404;11;987148038;11;987432606;11;987694281\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"]},
+                {"in":1,"out":1,"ops":["digits_only"]},
+                {"in":2,"out":2,"ops":["digits_only"]}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1, // static_cols
+            2, // group_size
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+
+        assert_eq!((i, o, inv), (1, 3, 0));
+        let out_str = std::str::from_utf8(&output).unwrap();
+        assert_eq!(
+            out_str,
+            "33176825404;11;987148038\n\
+             33176825404;11;987432606\n\
+             33176825404;11;987694281\n"
+        );
+    }
+
+    #[test]
+    fn denormalize_multiple_input_rows() {
+        // 2 linhas de entrada, cada uma com 2 grupos → 4 linhas de saída
+        let input: &[u8] = b"aaa;11;1111;22;2222\n\
+                            bbb;33;3333;44;4444\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":[]},
+                {"in":1,"out":1,"ops":[]},
+                {"in":2,"out":2,"ops":[]}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, _) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+
+        assert_eq!((i, o), (2, 4));
+        let out_str = std::str::from_utf8(&output).unwrap();
+        assert_eq!(
+            out_str,
+            "aaa;11;1111\n\
+             aaa;22;2222\n\
+             bbb;33;3333\n\
+             bbb;44;4444\n"
+        );
+    }
+
+    #[test]
+    fn denormalize_skips_incomplete_trailing_group() {
+        // doc + 1 grupo completo + 1 coluna "sobrando" (ímpar no fim)
+        let input: &[u8] = b"doc;11;1111;22\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":[]},
+                {"in":1,"out":1,"ops":[]},
+                {"in":2,"out":2,"ops":[]}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, _) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+
+        // Só o grupo completo é emitido; o "22" solto é ignorado.
+        assert_eq!((i, o), (1, 1));
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "doc;11;1111\n");
+    }
+
+    #[test]
+    fn denormalize_skips_rows_shorter_than_static_prefix() {
+        // Linha com 0 colunas depois do prefixo → zero saídas para essa linha
+        let input: &[u8] = b"doc\n\
+                            doc;11;1111\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":[]},
+                {"in":1,"out":1,"ops":[]},
+                {"in":2,"out":2,"ops":[]}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, _) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+
+        assert_eq!((i, o), (2, 1));
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "doc;11;1111\n");
+    }
+
+    #[test]
+    fn denormalize_runs_validators_per_output_row() {
+        // 1 input com 3 grupos; 1 grupo tem DDD inválido → essa saída cai,
+        // as outras 2 passam.
+        let input: &[u8] = b"33176825404;11;987148038;10;999999999;12;987432606\n";
+        //                                 ^^ válido  ^^ inválido (10)  ^^ válido
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+
+        // 1 input → 3 tentativas → 2 válidas, 1 inválida
+        assert_eq!((i, o, inv), (1, 2, 1));
+        let out_str = std::str::from_utf8(&output).unwrap();
+        assert!(out_str.contains("33176825404;11;987148038"));
+        assert!(out_str.contains("33176825404;12;987432606"));
+        assert!(!out_str.contains("999999999"));
+    }
+
+    #[test]
+    fn denormalize_rejects_invalid_virtual_column_index() {
+        // Layout declara in:3 mas virtual width é 1+2=3 (válidos: 0, 1, 2)
+        let input: &[u8] = b"a;b;c\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[{"in":3,"out":0,"ops":[]}]"#,
+        )
+        .unwrap();
+
+        let err = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds virtual row width"));
+    }
+
+    #[test]
+    fn denormalize_rejects_zero_group_size() {
+        let input: &[u8] = b"a;b\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
+
+        let err = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            0, // group_size inválido
+            false,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap_err();
+        assert!(err.contains("group_size"));
+    }
+
+    #[test]
+    fn denormalize_respects_escape_formulas_per_output() {
+        // Um grupo tem '=' no input → deve ser escapado nas saídas
+        let input: &[u8] = b"doc;=CMD;safe\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":[]},
+                {"in":1,"out":1,"ops":[]},
+                {"in":2,"out":2,"ops":[]}
+            ]"#,
+        )
+        .unwrap();
+
+        process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            true,
+            csv::QuoteStyle::Necessary,
+        )
+        .unwrap();
+
+        let out_str = std::str::from_utf8(&output).unwrap();
+        assert!(out_str.contains("'=CMD"));
+    }
+
+    #[test]
+    fn denormalize_bcp_mode_no_quoting_no_escape() {
+        let input: &[u8] = b"doc;11;1111;22;2222\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":[]},
+                {"in":1,"out":1,"ops":[]},
+                {"in":2,"out":2,"ops":[]}
+            ]"#,
+        )
+        .unwrap();
+
+        process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,                   // escape_formulas off
+            csv::QuoteStyle::Never,   // no quoting
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            b"doc;11;1111\ndoc;22;2222\n"
+        );
+    }
+
+    // ===========================================================
+    // process_parallel_denormalize_impl (com arquivos reais)
+    // ===========================================================
+
+    #[test]
+    fn parallel_denormalize_user_case_document_ddd_phone() {
+        // Caso de uso real: document + múltiplos (ddd, phone) por linha.
+        let dir = unique_temp_dir("pp_denorm_user");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(
+            &input,
+            "33176825404;82;987148038;82;987432606;82;987694281\n\
+             33176841000;47;984192969;47;996592586\n\
+             33176906315;74;999659384;75;998779719;85;987348663\n",
+        );
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_denormalize_impl(
+                path_str(&input),
+                path_str(&output),
+                4,
+                ";",
+                ";",
+                false,
+                1,
+                2,
+                r#"[
+                    {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                    {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                    {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+                ]"#,
+                false,
+                "never",
+            )
+            .unwrap();
+
+        // 3 inputs → 3+2+3 = 8 grupos, todos válidos
+        assert_eq!(res, vec![3, 8, 0]);
+
+        // Ordem preservada (buffer-merge sequencial)
+        let out = read_file(&output);
+        let expected = "33176825404;82;987148038\n\
+                        33176825404;82;987432606\n\
+                        33176825404;82;987694281\n\
+                        33176841000;47;984192969\n\
+                        33176841000;47;996592586\n\
+                        33176906315;74;999659384\n\
+                        33176906315;75;998779719\n\
+                        33176906315;85;987348663\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn parallel_denormalize_parity_with_manual_flattening() {
+        // Processar o arquivo desnormalizado diretamente vs. achatar manualmente
+        // e processar com processParallel deve dar output IDÊNTICO.
+        let dir_denorm = unique_temp_dir("parity_denorm");
+        let dir_flat = unique_temp_dir("parity_flat");
+
+        let input_denorm = dir_denorm.join("in.csv");
+        let input_flat = dir_flat.join("in.csv");
+        let out_denorm = dir_denorm.join("out.csv");
+        let out_flat = dir_flat.join("out.csv");
+
+        write_file(
+            &input_denorm,
+            "aaa;11;1111;22;2222\n\
+             bbb;33;3333\n",
+        );
+        // Achatado manualmente
+        write_file(
+            &input_flat,
+            "aaa;11;1111\n\
+             aaa;22;2222\n\
+             bbb;33;3333\n",
+        );
+
+        let layout = r#"[
+            {"in":0,"out":0,"ops":[]},
+            {"in":1,"out":1,"ops":[]},
+            {"in":2,"out":2,"ops":[]}
+        ]"#;
+
+        let fp = FileProcessor;
+        let denorm_totals = fp
+            .process_parallel_denormalize_impl(
+                path_str(&input_denorm),
+                path_str(&out_denorm),
+                2,
+                ";",
+                ";",
+                false,
+                1,
+                2,
+                layout,
+                false,
+                "never",
+            )
+            .unwrap();
+        let flat_totals = fp
+            .process_parallel_impl(
+                path_str(&input_flat),
+                path_str(&out_flat),
+                2,
+                ";",
+                ";",
+                false,
+                layout,
+                false,
+                "never",
+            )
+            .unwrap();
+
+        // output_count deve bater (são as saídas escritas)
+        assert_eq!(denorm_totals[1], flat_totals[1]);
+        // conteúdo dos arquivos deve ser byte-idêntico
+        assert_eq!(read_file(&out_denorm), read_file(&out_flat));
+    }
+
+    #[test]
+    fn parallel_denormalize_drops_invalid_groups_preserves_valid() {
+        // Mistura de grupos válidos e inválidos no MESMO input
+        let dir = unique_temp_dir("pp_denorm_validity");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        // doc válido, 3 grupos: válido, inválido (DDD 10), válido
+        write_file(
+            &input,
+            "33176825404;11;987148038;10;999999999;12;987432606\n",
+        );
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_denormalize_impl(
+                path_str(&input),
+                path_str(&output),
+                1,
+                ";",
+                ";",
+                false,
+                1,
+                2,
+                r#"[
+                    {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                    {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                    {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+                ]"#,
+                false,
+                "never",
+            )
+            .unwrap();
+
+        assert_eq!(res, vec![1, 2, 1]);
+        let out = read_file(&output);
+        assert!(out.contains("987148038"));
+        assert!(out.contains("987432606"));
+        assert!(!out.contains("999999999"));
+    }
+
+    #[test]
+    fn parallel_denormalize_rejects_out_of_range_input_index_early() {
+        // Erro de bounds vem antes de abrir o arquivo
+        let dir = unique_temp_dir("pp_denorm_bad_layout");
+        let input = dir.join("in.csv");
+        write_file(&input, "a;b;c\n");
+
+        let fp = FileProcessor;
+        let err = fp
+            .process_parallel_denormalize_impl(
+                path_str(&input),
+                path_str(&dir.join("out.csv")),
+                1,
+                ";",
+                ";",
+                false,
+                1,
+                2,
+                r#"[{"in":5,"out":0,"ops":[]}]"#, // virtual width = 3, in:5 é inválido
+                false,
+                "never",
+            )
+            .unwrap_err();
+        assert!(err.contains("exceeds virtual row width"));
     }
 
     // ===========================================================
