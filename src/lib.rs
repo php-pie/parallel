@@ -11,7 +11,8 @@ pub use layout::{parse_columns, ColumnConfig};
 pub use operations::{parse_op, Operation};
 pub use processor::FileProcessor;
 pub use validators::{
-    parse_validator, validate_cnpj, validate_cpf, validate_email, validate_phone_br, Validator,
+    parse_validator, validate_area_code, validate_cnpj, validate_cpf, validate_document,
+    validate_email, validate_phone, Validator,
 };
 
 #[cfg(feature = "extension")]

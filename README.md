@@ -386,12 +386,15 @@ As operações são aplicadas **na ordem declarada**. Em `["digits_only", "pad_l
 | Validador | Regra |
 |---|---|
 | `cpf` | 11 dígitos, dígitos verificadores válidos, rejeita sequências repetidas (ex: `11111111111`) |
-| `phone_br` | 10 ou 11 dígitos, DDD não começa com 0, celular (11 dígitos) deve ter `9` na terceira posição |
 | `cnpj` | 14 dígitos, dígitos verificadores válidos, rejeita sequências repetidas. Aceita formatado (`11.222.333/0001-81`) |
+| `document` | Aceita CPF **ou** CNPJ. Útil quando a coluna `document` pode ser de qualquer dos dois tipos |
+| `area_code` | DDD brasileiro (2 dígitos). Lista oficial de áreas válidas — rejeita códigos inexistentes como `10`, `23`, `52`, `78`, etc |
+| `phone` | Telefone **sem DDD** (assinante). Fixo: 8 dígitos começando com 2-8; celular: 9 dígitos começando com 9 |
 | `email` | Heurística: `local@dominio` com ponto no domínio, sem espaços, um único `@` |
-| `length:<min>:<max>` | Contagem de chars (UTF-8, não bytes) no intervalo `[min, max]` |
 | `regex:<padrão>` | Sintaxe regex da crate [`regex`](https://docs.rs/regex/). Compilado uma vez por layout |
 | `not_blank` | Campo não pode estar vazio. Combina com `_canonical` ops para dropar linhas em que o campo-chave ficou vazio após canonicalização |
+
+**Nota sobre `phone`:** a validação é só do assinante (sem DDD). Para validar DDD + número completo, use duas colunas separadas com `area_code` e `phone` (espelha o modelo do `DataSanitizer` PHP onde DDD e telefone vivem em campos separados).
 
 Se uma coluna com `validate` falhar, a **linha inteira** é descartada e contabilizada em `invalid_count`.
 

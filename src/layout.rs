@@ -77,9 +77,23 @@ mod tests {
 
     #[test]
     fn parse_columns_with_phone_validator() {
-        let json = r#"[{"in":0,"out":0,"ops":[],"validate":"phone_br"}]"#;
+        let json = r#"[{"in":0,"out":0,"ops":[],"validate":"phone"}]"#;
         let cols = parse_columns(json).unwrap();
-        assert!(matches!(cols[0].validate, Some(Validator::PhoneBr)));
+        assert!(matches!(cols[0].validate, Some(Validator::Phone)));
+    }
+
+    #[test]
+    fn parse_columns_with_document_validator() {
+        let json = r#"[{"in":0,"out":0,"ops":[],"validate":"document"}]"#;
+        let cols = parse_columns(json).unwrap();
+        assert!(matches!(cols[0].validate, Some(Validator::Document)));
+    }
+
+    #[test]
+    fn parse_columns_with_area_code_validator() {
+        let json = r#"[{"in":0,"out":0,"ops":[],"validate":"area_code"}]"#;
+        let cols = parse_columns(json).unwrap();
+        assert!(matches!(cols[0].validate, Some(Validator::AreaCode)));
     }
 
     #[test]
@@ -111,28 +125,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_columns_accepts_new_validators() {
+    fn parse_columns_accepts_multiple_validators() {
         let json = r#"[
             {"in":0,"out":0,"ops":[],"validate":"cnpj"},
             {"in":1,"out":1,"ops":[],"validate":"email"},
-            {"in":2,"out":2,"ops":[],"validate":"length:3:50"},
-            {"in":3,"out":3,"ops":[],"validate":"regex:^\\d+$"}
+            {"in":2,"out":2,"ops":[],"validate":"area_code"},
+            {"in":3,"out":3,"ops":[],"validate":"phone"},
+            {"in":4,"out":4,"ops":[],"validate":"document"},
+            {"in":5,"out":5,"ops":[],"validate":"not_blank"},
+            {"in":6,"out":6,"ops":[],"validate":"regex:^\\d+$"}
         ]"#;
         let cols = parse_columns(json).unwrap();
-        assert_eq!(cols.len(), 4);
+        assert_eq!(cols.len(), 7);
         assert!(matches!(cols[0].validate, Some(Validator::Cnpj)));
         assert!(matches!(cols[1].validate, Some(Validator::Email)));
-        assert!(matches!(cols[2].validate, Some(Validator::Length(3, 50))));
-        assert!(matches!(cols[3].validate, Some(Validator::Regex(_))));
+        assert!(matches!(cols[2].validate, Some(Validator::AreaCode)));
+        assert!(matches!(cols[3].validate, Some(Validator::Phone)));
+        assert!(matches!(cols[4].validate, Some(Validator::Document)));
+        assert!(matches!(cols[5].validate, Some(Validator::NotBlank)));
+        assert!(matches!(cols[6].validate, Some(Validator::Regex(_))));
     }
 
     #[test]
     fn parse_columns_surfaces_validator_error_with_column_index() {
         let json = r#"[
             {"in":0,"out":0,"ops":[]},
-            {"in":1,"out":1,"ops":[],"validate":"length:bad:args"}
+            {"in":1,"out":1,"ops":[],"validate":"nonsense"}
         ]"#;
         let err = parse_columns(json).unwrap_err();
         assert!(err.contains("column 1"));
+        assert!(err.contains("unknown validator"));
     }
 }

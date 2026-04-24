@@ -1,10 +1,20 @@
 #[derive(Clone, Debug)]
 pub enum Validator {
+    /// CPF brasileiro (11 dígitos + dígitos verificadores).
     Cpf,
-    PhoneBr,
+    /// CNPJ brasileiro (14 dígitos + dígitos verificadores).
     Cnpj,
+    /// CPF OU CNPJ — aceita qualquer um dos dois. Útil para o campo
+    /// `document` que pode ser qualquer dos dois tipos.
+    Document,
+    /// DDD brasileiro (2 dígitos, lista oficial de áreas válidas).
+    AreaCode,
+    /// Número de telefone brasileiro SEM DDD (assinante).
+    /// Fixo: 8 dígitos começando com 2-8. Celular: 9 dígitos começando com 9.
+    Phone,
+    /// Email (heurística: `local@dominio` com ponto no domínio).
     Email,
-    Length(usize, usize),
+    /// Regex arbitrária (sintaxe da crate `regex`).
     Regex(regex::Regex),
     /// Campo não pode estar em branco. Combina com ops canônicos que
     /// retornam `""` em caso de falha (ex.: `document_canonical`) para
@@ -16,13 +26,11 @@ impl Validator {
     pub fn check(&self, s: &str) -> bool {
         match self {
             Validator::Cpf => validate_cpf(s),
-            Validator::PhoneBr => validate_phone_br(s),
             Validator::Cnpj => validate_cnpj(s),
+            Validator::Document => validate_document(s),
+            Validator::AreaCode => validate_area_code(s),
+            Validator::Phone => validate_phone(s),
             Validator::Email => validate_email(s),
-            Validator::Length(min, max) => {
-                let count = s.chars().count();
-                count >= *min && count <= *max
-            }
             Validator::Regex(re) => re.is_match(s),
             Validator::NotBlank => !s.is_empty(),
         }
@@ -36,28 +44,12 @@ pub fn parse_validator(spec: &str) -> Result<Validator, String> {
     };
     match name {
         "cpf" => Ok(Validator::Cpf),
-        "phone_br" => Ok(Validator::PhoneBr),
         "cnpj" => Ok(Validator::Cnpj),
+        "document" => Ok(Validator::Document),
+        "area_code" => Ok(Validator::AreaCode),
+        "phone" => Ok(Validator::Phone),
         "email" => Ok(Validator::Email),
         "not_blank" => Ok(Validator::NotBlank),
-        "length" => {
-            let args = rest.ok_or_else(|| {
-                "length requires args: 'length:<min>:<max>'".to_string()
-            })?;
-            let (min_s, max_s) = args.split_once(':').ok_or_else(|| {
-                "length requires both min and max: 'length:<min>:<max>'".to_string()
-            })?;
-            let min: usize = min_s.parse().map_err(|_| {
-                format!("length min must be a non-negative integer, got '{}'", min_s)
-            })?;
-            let max: usize = max_s.parse().map_err(|_| {
-                format!("length max must be a non-negative integer, got '{}'", max_s)
-            })?;
-            if min > max {
-                return Err(format!("length min ({}) must be <= max ({})", min, max));
-            }
-            Ok(Validator::Length(min, max))
-        }
         "regex" => {
             let pattern = rest.ok_or_else(|| {
                 "regex requires a pattern: 'regex:<pattern>'".to_string()
@@ -67,7 +59,7 @@ pub fn parse_validator(spec: &str) -> Result<Validator, String> {
             Ok(Validator::Regex(re))
         }
         other => Err(format!(
-            "unknown validator '{}'; expected one of: cpf, phone_br, cnpj, email, length, regex, not_blank",
+            "unknown validator '{}'; expected one of: cpf, cnpj, document, area_code, phone, email, regex, not_blank",
             other
         )),
     }
@@ -94,22 +86,49 @@ pub fn validate_cpf(s: &str) -> bool {
     d2 as u8 == digits[10]
 }
 
-pub fn validate_phone_br(s: &str) -> bool {
+/// Telefone brasileiro **sem DDD** (assinante). Alinha com o
+/// `sanitizePhoneNumber` do DataSanitizer.
+///
+/// - Fixo: 8 dígitos, primeiro dígito ∈ 2-8 (`[2-8]\d{7}`)
+/// - Celular: 9 dígitos, primeiro dígito é `9` (`9\d{8}`)
+///
+/// Para o número completo com DDD, use duas colunas: uma com validador
+/// `area_code` (os 2 dígitos do DDD) e outra com `phone` (o assinante).
+pub fn validate_phone(s: &str) -> bool {
     let digits: Vec<u8> = s.bytes().filter(|b| b.is_ascii_digit()).collect();
-    let len = digits.len();
-    // 10 (fixo) ou 11 (celular com 9)
-    if len != 10 && len != 11 {
+    match digits.len() {
+        8 => matches!(digits[0], b'2'..=b'8'),
+        9 => digits[0] == b'9',
+        _ => false,
+    }
+}
+
+/// Valida se uma string é CPF **ou** CNPJ. Útil para o campo `document`
+/// que pode ser qualquer um dos dois tipos.
+pub fn validate_document(s: &str) -> bool {
+    validate_cpf(s) || validate_cnpj(s)
+}
+
+/// DDD brasileiro (2 dígitos). Lista oficial de áreas:
+///
+/// - `11-19` (SP), `21 22 24 27 28` (RJ/ES), `31-35 37 38` (MG),
+///   `41-49` (Sul), `51 53 54 55` (RS), `61-69` (DF/GO/TO/MT/MS/AC/RO),
+///   `71 73 74 75 77 79` (BA/SE), `81-89` (NE), `91-99` (N)
+pub fn validate_area_code(s: &str) -> bool {
+    let digits: Vec<u8> = s.bytes().filter(|b| b.is_ascii_digit()).collect();
+    if digits.len() != 2 {
         return false;
     }
-    // DDD válido (11-99, não começa com 0)
-    if digits[0] == b'0' {
-        return false;
+    let d0 = digits[0];
+    let d1 = digits[1];
+    match d0 {
+        b'1' | b'4' | b'6' | b'8' | b'9' => matches!(d1, b'1'..=b'9'),
+        b'2' => matches!(d1, b'1' | b'2' | b'4' | b'7' | b'8'),
+        b'3' => matches!(d1, b'1'..=b'5' | b'7' | b'8'),
+        b'5' => matches!(d1, b'1' | b'3' | b'4' | b'5'),
+        b'7' => matches!(d1, b'1' | b'3' | b'4' | b'5' | b'7' | b'9'),
+        _ => false,
     }
-    // celular (11 dígitos) deve ter 9 na terceira posição
-    if len == 11 && digits[2] != b'9' {
-        return false;
-    }
-    true
 }
 
 pub fn validate_cnpj(s: &str) -> bool {
@@ -211,41 +230,134 @@ mod tests {
     }
 
     // ===========================================================
-    // validate_phone_br
+    // validate_phone (sem DDD — assinante apenas)
     // ===========================================================
 
     #[test]
-    fn phone_accepts_landline_10_digits() {
-        assert!(validate_phone_br("1122334455"));
+    fn phone_accepts_landline_8_digits() {
+        assert!(validate_phone("22334455")); // fixo começando com 2
+        assert!(validate_phone("88887777")); // fixo começando com 8
     }
 
     #[test]
-    fn phone_accepts_cellphone_11_digits_with_9() {
-        assert!(validate_phone_br("11987654321"));
+    fn phone_accepts_cellphone_9_digits_starting_with_9() {
+        assert!(validate_phone("987654321"));
+        assert!(validate_phone("999998888"));
+    }
+
+    #[test]
+    fn phone_rejects_landline_starting_with_9() {
+        // 8 dígitos começando com 9 é inválido (celular precisa ter 9 dígitos)
+        assert!(!validate_phone("92345678"));
+    }
+
+    #[test]
+    fn phone_rejects_landline_starting_with_1() {
+        assert!(!validate_phone("12345678"));
     }
 
     #[test]
     fn phone_rejects_cellphone_without_leading_9() {
-        assert!(!validate_phone_br("11887654321"));
-    }
-
-    #[test]
-    fn phone_rejects_ddd_starting_with_zero() {
-        assert!(!validate_phone_br("0122334455"));
-        assert!(!validate_phone_br("01987654321"));
+        assert!(!validate_phone("887654321"));
     }
 
     #[test]
     fn phone_rejects_wrong_length() {
-        assert!(!validate_phone_br(""));
-        assert!(!validate_phone_br("123"));
-        assert!(!validate_phone_br("123456789"));
-        assert!(!validate_phone_br("123456789012"));
+        assert!(!validate_phone(""));
+        assert!(!validate_phone("123"));
+        assert!(!validate_phone("1234567"));      // 7
+        assert!(!validate_phone("1234567890"));   // 10
     }
 
     #[test]
     fn phone_strips_non_digits_before_validating() {
-        assert!(validate_phone_br("(11) 98765-4321"));
+        assert!(validate_phone("98765-4321"));
+    }
+
+    // ===========================================================
+    // validate_document (CPF ou CNPJ)
+    // ===========================================================
+
+    #[test]
+    fn document_accepts_valid_cpf() {
+        assert!(validate_document("12345678909"));
+        assert!(validate_document("123.456.789-09"));
+    }
+
+    #[test]
+    fn document_accepts_valid_cnpj() {
+        assert!(validate_document("11222333000181"));
+        assert!(validate_document("11.222.333/0001-81"));
+    }
+
+    #[test]
+    fn document_rejects_invalid() {
+        assert!(!validate_document(""));
+        assert!(!validate_document("11111111111"));
+        assert!(!validate_document("11111111111111"));
+        assert!(!validate_document("12345"));
+    }
+
+    // ===========================================================
+    // validate_area_code
+    // ===========================================================
+
+    #[test]
+    fn area_code_accepts_valid_ddds() {
+        // SP
+        for cc in ["11", "12", "13", "14", "15", "16", "17", "18", "19"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // RJ/ES
+        for cc in ["21", "22", "24", "27", "28"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // MG
+        for cc in ["31", "32", "33", "34", "35", "37", "38"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // Sul
+        for cc in ["41", "42", "43", "44", "45", "46", "47", "48", "49"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // RS
+        for cc in ["51", "53", "54", "55"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // Centro-Oeste / N
+        for cc in ["61", "62", "63", "64", "65", "66", "67", "68", "69"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // BA/SE
+        for cc in ["71", "73", "74", "75", "77", "79"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+        // NE / N
+        for cc in ["81", "91", "99"] {
+            assert!(validate_area_code(cc), "expected {} to be valid", cc);
+        }
+    }
+
+    #[test]
+    fn area_code_rejects_holes_in_list() {
+        // Números que não são DDDs válidos
+        for cc in ["10", "20", "23", "25", "26", "29", "30", "36", "39", "40",
+                   "50", "52", "56", "57", "58", "59", "60", "70", "72", "76", "78",
+                   "80", "90"] {
+            assert!(!validate_area_code(cc), "expected {} to be invalid", cc);
+        }
+    }
+
+    #[test]
+    fn area_code_rejects_wrong_length() {
+        assert!(!validate_area_code(""));
+        assert!(!validate_area_code("1"));
+        assert!(!validate_area_code("111"));
+    }
+
+    #[test]
+    fn area_code_strips_non_digits() {
+        assert!(validate_area_code("(11)"));
     }
 
     // ===========================================================
@@ -332,32 +444,28 @@ mod tests {
     }
 
     #[test]
-    fn validator_phone_delegates_to_validate_phone_br() {
-        assert!(Validator::PhoneBr.check("11987654321"));
-        assert!(!Validator::PhoneBr.check("01987654321"));
-    }
-
-    // ===========================================================
-    // Validator::Length
-    // ===========================================================
-
-    #[test]
-    fn length_accepts_within_range() {
-        assert!(Validator::Length(3, 5).check("abc"));
-        assert!(Validator::Length(3, 5).check("abcd"));
-        assert!(Validator::Length(3, 5).check("abcde"));
+    fn validator_cnpj_delegates_to_validate_cnpj() {
+        assert!(Validator::Cnpj.check("11222333000181"));
+        assert!(!Validator::Cnpj.check("11111111111111"));
     }
 
     #[test]
-    fn length_rejects_out_of_range() {
-        assert!(!Validator::Length(3, 5).check("ab"));
-        assert!(!Validator::Length(3, 5).check("abcdef"));
+    fn validator_document_delegates_to_validate_document() {
+        assert!(Validator::Document.check("12345678909"));      // CPF
+        assert!(Validator::Document.check("11222333000181"));   // CNPJ
+        assert!(!Validator::Document.check("11111111111"));
     }
 
     #[test]
-    fn length_counts_chars_not_bytes() {
-        assert!(Validator::Length(5, 5).check("áéíóú"));
-        assert!(!Validator::Length(10, 10).check("áéíóú"));
+    fn validator_phone_delegates_to_validate_phone() {
+        assert!(Validator::Phone.check("987654321"));
+        assert!(!Validator::Phone.check("12345678"));
+    }
+
+    #[test]
+    fn validator_area_code_delegates_to_validate_area_code() {
+        assert!(Validator::AreaCode.check("11"));
+        assert!(!Validator::AreaCode.check("10"));
     }
 
     // ===========================================================
@@ -380,33 +488,25 @@ mod tests {
     #[test]
     fn parse_validator_bare_names() {
         assert!(matches!(parse_validator("cpf"), Ok(Validator::Cpf)));
-        assert!(matches!(parse_validator("phone_br"), Ok(Validator::PhoneBr)));
         assert!(matches!(parse_validator("cnpj"), Ok(Validator::Cnpj)));
+        assert!(matches!(parse_validator("document"), Ok(Validator::Document)));
+        assert!(matches!(parse_validator("area_code"), Ok(Validator::AreaCode)));
+        assert!(matches!(parse_validator("phone"), Ok(Validator::Phone)));
         assert!(matches!(parse_validator("email"), Ok(Validator::Email)));
     }
 
     #[test]
-    fn parse_validator_length_with_args() {
-        match parse_validator("length:3:50") {
-            Ok(Validator::Length(min, max)) => {
-                assert_eq!(min, 3);
-                assert_eq!(max, 50);
-            }
-            _ => panic!("expected Length"),
-        }
+    fn parse_validator_old_phone_br_rejected() {
+        // phone_br foi renomeado para phone
+        let err = parse_validator("phone_br").unwrap_err();
+        assert!(err.contains("unknown validator"));
     }
 
     #[test]
-    fn parse_validator_length_rejects_missing_args() {
-        assert!(parse_validator("length").is_err());
-        assert!(parse_validator("length:3").is_err());
-        assert!(parse_validator("length:abc:5").is_err());
-    }
-
-    #[test]
-    fn parse_validator_length_rejects_min_gt_max() {
-        let err = parse_validator("length:10:5").unwrap_err();
-        assert!(err.contains("min") && err.contains("max"));
+    fn parse_validator_old_length_rejected() {
+        // length foi removido — use regex:^.{min,max}$ se precisar
+        let err = parse_validator("length:3:50").unwrap_err();
+        assert!(err.contains("unknown validator"));
     }
 
     #[test]
