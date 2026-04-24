@@ -43,6 +43,46 @@ fn csv_writer<W: std::io::Write>(delim: u8, writer: W) -> csv::Writer<W> {
         .from_writer(writer)
 }
 
+/// Processa todos os records de `reader` aplicando `columns` e escreve em
+/// `writer`. Genérico em `Read`/`Write` — qualquer fonte que implemente
+/// `Read` serve (arquivo, `&[u8]`, `Cursor<Vec<u8>>`, socket).
+///
+/// Propaga erros de leitura (record mal formado) e escrita. Para o caso de
+/// processamento por chunks em paralelo, onde queremos resiliência por chunk,
+/// use diretamente o loop de `process_chunks_impl` que faz continue/break
+/// conforme o tipo de erro.
+///
+/// Retorna `(input_count, output_count, invalid_count)`.
+pub fn process_records<R: std::io::Read, W: std::io::Write>(
+    reader: R,
+    writer: W,
+    input_delimiter: u8,
+    output_delimiter: u8,
+    skip_header: bool,
+    columns: &[ColumnConfig],
+) -> Result<(i64, i64, i64), String> {
+    let max_out = max_output_index(columns);
+    let mut rdr = csv_reader(input_delimiter, skip_header, reader);
+    let mut wtr = csv_writer(output_delimiter, writer);
+
+    let mut input_count = 0i64;
+    let mut output_count = 0i64;
+    let mut out_row: Vec<String> = vec![String::new(); max_out];
+
+    for result in rdr.records() {
+        let record = result.map_err(|e| e.to_string())?;
+        input_count += 1;
+        let written = transform_and_write(&record, columns, &mut out_row, &mut wtr)
+            .map_err(|e| e.to_string())?;
+        if written {
+            output_count += 1;
+        }
+    }
+    wtr.flush().map_err(|e| e.to_string())?;
+
+    Ok((input_count, output_count, input_count - output_count))
+}
+
 /// Aplica o layout numa record e escreve a saída se for válida.
 /// Retorna `Ok(true)` se a linha foi escrita, `Ok(false)` se foi descartada
 /// por um validator, e `Err` apenas se o writer CSV falhar.
@@ -137,32 +177,17 @@ impl FileProcessor {
         let columns = parse_columns(columns_json)?;
         let in_delim = parse_delimiter(input_delimiter, b';');
         let out_delim = parse_delimiter(output_delimiter, b';');
-        let max_out = max_output_index(&columns);
 
         let file = File::open(input_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
         let data: &[u8] = &mmap;
 
-        let mut rdr = csv_reader(in_delim, skip_header, data);
         let out_file = File::create(output_path).map_err(|e| e.to_string())?;
-        let mut wtr = csv_writer(out_delim, out_file);
 
-        let mut input_count = 0i64;
-        let mut output_count = 0i64;
-        let mut out_row: Vec<String> = vec![String::new(); max_out];
+        let (input, output, invalid) =
+            process_records(data, out_file, in_delim, out_delim, skip_header, &columns)?;
 
-        for result in rdr.records() {
-            let record = result.map_err(|e| e.to_string())?;
-            input_count += 1;
-            let written = transform_and_write(&record, &columns, &mut out_row, &mut wtr)
-                .map_err(|e| e.to_string())?;
-            if written {
-                output_count += 1;
-            }
-        }
-        wtr.flush().map_err(|e| e.to_string())?;
-
-        Ok(vec![input_count, output_count, input_count - output_count])
+        Ok(vec![input, output, invalid])
     }
 
     /// Processa todos os chunks em paralelo. Retorna [input, output, invalid] totais.
@@ -432,6 +457,85 @@ mod tests {
             .split_file_impl(path_str(&input), path_str(&dir), 1)
             .unwrap();
         assert_eq!(counts, vec![3]);
+    }
+
+    // ===========================================================
+    // process_records (in-memory, sem tmpdir)
+    // ===========================================================
+
+    use crate::layout::parse_columns;
+
+    #[test]
+    fn process_records_in_memory_applies_ops() {
+        let input: &[u8] = b"alice;30\nbob;25\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[{"in":0,"out":0,"ops":["uppercase"]},{"in":1,"out":1,"ops":[]}]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns).unwrap();
+        assert_eq!((i, o, inv), (2, 2, 0));
+        assert_eq!(output, b"ALICE;30\nBOB;25\n");
+    }
+
+    #[test]
+    fn process_records_in_memory_skips_header() {
+        let input: &[u8] = b"name;age\nalice;30\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns =
+            parse_columns(r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":[]}]"#).unwrap();
+
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', true, &columns).unwrap();
+        assert_eq!((i, o, inv), (1, 1, 0));
+        assert_eq!(output, b"alice;30\n");
+    }
+
+    #[test]
+    fn process_records_in_memory_filters_invalid() {
+        let input: &[u8] = b"11111111111\n12345678909\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns =
+            parse_columns(r#"[{"in":0,"out":0,"ops":[],"validate":"cpf"}]"#).unwrap();
+
+        let (i, o, inv) = process_records(input, &mut output, b';', b';', false, &columns).unwrap();
+        assert_eq!((i, o, inv), (2, 1, 1));
+        assert_eq!(output, b"12345678909\n");
+    }
+
+    #[test]
+    fn process_records_in_memory_handles_quoted_fields() {
+        let input: &[u8] = b"1;\"Silva; Junior\";42\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[{"in":0,"out":0,"ops":[]},{"in":1,"out":1,"ops":["uppercase"]},{"in":2,"out":2,"ops":[]}]"#,
+        )
+        .unwrap();
+
+        let (i, o, _) = process_records(input, &mut output, b';', b';', false, &columns).unwrap();
+        assert_eq!((i, o), (1, 1));
+        // Campo com delimitador embutido é re-quotado pelo csv::Writer.
+        assert_eq!(output, b"1;\"SILVA; JUNIOR\";42\n");
+    }
+
+    #[test]
+    fn process_records_propagates_write_error() {
+        // Writer que falha imediatamente para exercitar o caminho de erro.
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "nope"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "nope"))
+            }
+        }
+
+        let input: &[u8] = b"a\n";
+        let columns = parse_columns(r#"[{"in":0,"out":0,"ops":[]}]"#).unwrap();
+        let err =
+            process_records(input, FailingWriter, b';', b';', false, &columns).unwrap_err();
+        assert!(err.to_lowercase().contains("nope") || err.to_lowercase().contains("io"));
     }
 
     // ===========================================================
