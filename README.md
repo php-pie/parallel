@@ -314,7 +314,7 @@ $totals = $processor->processParallel(
 [$in, $out, $invalid] = $totals;
 ```
 
-### `processParallelDenormalize(string $inputPath, string $outputPath, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, int $staticCols, int $groupSize, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary'): array`
+### `processParallelDenormalize(string $inputPath, string $outputPath, int $chunks, string $inputDelimiter, string $outputDelimiter, bool $skipHeader, int $staticCols, int $groupSize, string $columnsJson, ?bool $escapeFormulas = true, ?string $quoteStyle = 'necessary', ?bool $emitPrefixOnAllInvalid = false): array`
 
 Variante de `processParallel` com **row fan-out**: cada linha de entrada com formato desnormalizado (prefixo estático + N grupos de colunas) vira múltiplas linhas de saída, uma por grupo. Pipeline paralelo via mmap + rayon, sem temp files.
 
@@ -340,11 +340,12 @@ Output (1 linha por grupo, prefixo replicado):
 - `$groupSize` — tamanho de cada grupo que se repete. No exemplo, 2 (ddd + phone)
 - `$columnsJson` — layout de **uma linha de saída normalizada**. Ver seção "Layout em modo denormalize"
 - `$escapeFormulas`, `$quoteStyle` — idênticos a `processParallel`
+- `$emitPrefixOnAllInvalid` — quando `true`, se o prefixo passa nos validators mas **nenhum grupo** foi emitido com sucesso, escreve **uma linha fallback** com apenas as colunas do prefixo preenchidas e as colunas do grupo em branco. Útil pra preservar o documento mesmo quando todos os telefones estão com DDD ruim. Default `false`. Ver "Preservando o prefixo" abaixo.
 
 **Retorno:** `[input_rows, output_rows, invalid_rows]`:
 
 - `input_rows` — linhas lidas do arquivo de entrada
-- `output_rows` — linhas efetivamente escritas no arquivo de saída (após fan-out + validação)
+- `output_rows` — linhas efetivamente escritas no arquivo de saída (após fan-out + validação, incluindo eventuais fallbacks prefix-only)
 - `invalid_rows` — tentativas de saída (1 por grupo) dropadas por algum `validate`
 
 ### Layout em modo denormalize
@@ -368,7 +369,41 @@ A extensão itera `i = 0, 1, 2, ...` (quantos grupos completos existirem) e apli
 - `in` maior que `staticCols + groupSize - 1` → **erro** no parse (bounds check antes de abrir o arquivo)
 - Validadores rodam **por linha de saída**: uma combinação `(doc, dddN, phoneN)` pode ser inválida enquanto outra `(doc, dddM, phoneM)` do mesmo doc é válida — ambos casos tratados corretamente
 
-**Exemplo completo (caso real: document + múltiplos DDD/phone):**
+### Preservando o prefixo (`emitPrefixOnAllInvalid`)
+
+Quando o **documento é chave obrigatória** e os demais campos (DDD, phone) são "nice-to-have", você pode querer que todo doc válido seja gravado ao menos uma vez — mesmo que nenhum dos seus grupos passe na validação. Ative `$emitPrefixOnAllInvalid = true`.
+
+**Regras exatas:**
+
+1. **Documento inválido** (prefixo falha no validador) → linha inteira **dropada**, zero saídas, fallback **não** dispara.
+2. **Documento válido + ao menos um grupo válido** → emite 1 linha por grupo válido (grupos inválidos são descartados). Fallback **não** dispara.
+3. **Documento válido + todos os grupos inválidos** → emite **uma única linha fallback** com o prefixo preenchido e as colunas do grupo em branco.
+4. **Documento válido + zero grupos no input** (ex.: linha só com o doc) → emite a linha fallback.
+
+**Exemplo:**
+
+```
+Input:
+  33176825404;82;987148038;82;987432606      ← doc válido, 2 grupos válidos
+  34829718897;0;997979072                    ← doc válido, 1 grupo com DDD=0
+  00000000000;11;987654321                   ← doc inválido (CPF zerado)
+  33176906315                                ← doc válido, sem grupos
+
+Output com emitPrefixOnAllInvalid=true:
+  33176825404;82;987148038
+  33176825404;82;987432606
+  34829718897;;                              ← fallback: doc preservado, campos em branco
+  33176906315;;                              ← fallback: doc preservado sozinho
+```
+
+Contadores para esse exemplo:
+- `input_rows = 4`
+- `output_rows = 4` (2 grupos + 1 fallback + 1 fallback)
+- `invalid_rows = 1` (o grupo com DDD=0)
+
+Linha 3 (doc inválido) **nem aparece** no output nem nos counters de invalid — é dropada antes da fase de grupos.
+
+**Exemplo completo (caso real: document + múltiplos DDD/phone, bcp):**
 
 ```php
 $processor = new FileProcessor();
@@ -389,7 +424,8 @@ $totals = $processor->processParallelDenormalize(
     2,                 // groupSize = 2 (ddd + phone por grupo)
     $layout,
     false,             // escape_formulas OFF (bcp)
-    'never'            // quote_style OFF (bcp)
+    'never',           // quote_style OFF (bcp)
+    true               // emitPrefixOnAllInvalid: preserva doc mesmo sem phone válido
 );
 
 [$in, $out, $invalid] = $totals;

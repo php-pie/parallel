@@ -128,17 +128,32 @@ fn csv_writer<W: std::io::Write>(
 /// enquanto outra `(doc, dddM, phM)` do mesmo doc é válida — ambos casos
 /// são tratados corretamente.
 ///
+/// **`emit_prefix_on_all_invalid`:** quando `true`, se o prefixo (colunas
+/// estáticas) passa nos validators mas **nenhum grupo** foi emitido com
+/// sucesso para essa linha de entrada, emite **uma linha fallback** com
+/// apenas as colunas do prefixo preenchidas e as colunas do grupo em
+/// branco. Útil quando o documento é a chave obrigatória e outros campos
+/// (DDD, phone) podem estar ruins — nesses casos, você preserva o
+/// documento mesmo sem telefone válido.
+///
 /// **Edge cases:**
 /// - Linha com menos de `static_cols` colunas → pulada (zero saídas).
 /// - Grupo parcial no final (ex.: sobrou 1 coluna com `group_size=2`) →
 ///   ignora o lixo e emite só os grupos completos.
+/// - Linha com prefixo válido mas zero grupos (ex.: só o documento) →
+///   com `emit_prefix_on_all_invalid=true`, emite uma linha só com o
+///   prefixo; com `false`, zero saídas.
+/// - Prefixo falha na validação (ex.: documento inválido) → linha inteira
+///   dropada, nenhuma saída (nem fallback).
 /// - `group_size=0` retorna erro de validação de parâmetros.
 ///
 /// Retorna `(input_count, output_count, invalid_count)`:
 /// - `input_count` — linhas lidas do input
-/// - `output_count` — linhas de saída efetivamente escritas
-/// - `invalid_count` — tentativas de saída (1 por grupo) dropadas por
-///   validator
+/// - `output_count` — linhas de saída efetivamente escritas (inclui
+///   eventuais fallbacks prefix-only quando `emit_prefix_on_all_invalid`)
+/// - `invalid_count` — tentativas de grupo dropadas por validator. Uma
+///   linha com 3 grupos todos ruins contribui 3 aqui; se
+///   `emit_prefix_on_all_invalid=true`, ainda assim sai 1 em `output_count`
 #[allow(clippy::too_many_arguments)]
 pub fn process_records_denormalize<R: std::io::Read, W: std::io::Write>(
     reader: R,
@@ -151,6 +166,7 @@ pub fn process_records_denormalize<R: std::io::Read, W: std::io::Write>(
     group_size: usize,
     escape_formulas: bool,
     quote_style: csv::QuoteStyle,
+    emit_prefix_on_all_invalid: bool,
 ) -> Result<(i64, i64, i64), String> {
     if group_size == 0 {
         return Err("group_size must be >= 1".to_string());
@@ -174,6 +190,10 @@ pub fn process_records_denormalize<R: std::io::Read, W: std::io::Write>(
     let mut output_count = 0i64;
     let mut invalid_count = 0i64;
     let mut out_row: Vec<String> = vec![String::new(); max_out];
+    // prefix_row: linha de saída com apenas as colunas de prefixo preenchidas.
+    // Construída uma vez por record e reutilizada como base para cada grupo,
+    // e como fallback quando nenhum grupo é emitido.
+    let mut prefix_row: Vec<String> = vec![String::new(); max_out];
 
     for result in rdr.records() {
         let record = result.map_err(|e| e.to_string())?;
@@ -183,38 +203,62 @@ pub fn process_records_denormalize<R: std::io::Read, W: std::io::Write>(
         if num_cols < static_cols {
             continue; // não cabe nem o prefixo
         }
+
+        // === Passo 1: construir e validar o prefixo uma única vez ===
+        for slot in prefix_row.iter_mut() {
+            slot.clear();
+        }
+        let mut prefix_valid = true;
+        for col in columns.iter().filter(|c| c.input_index < static_cols) {
+            let val = record.get(col.input_index).unwrap_or("");
+            let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
+            for op in &col.ops {
+                transformed = apply_op(op, transformed);
+            }
+            if let Some(v) = &col.validate {
+                if !v.check(&transformed) {
+                    prefix_valid = false;
+                    break;
+                }
+            }
+            prefix_row[col.output_index].push_str(&transformed);
+        }
+        if !prefix_valid {
+            // Prefixo (ex: documento) inválido → descarta a linha toda,
+            // nenhuma saída (nem fallback).
+            continue;
+        }
+
+        // === Passo 2: iterar grupos, emitir os válidos ===
         let num_groups = (num_cols - static_cols) / group_size;
+        let mut groups_emitted = 0i64;
 
         for group_idx in 0..num_groups {
-            // Reset dos slots da linha de saída
-            for slot in out_row.iter_mut() {
-                slot.clear();
+            // Copia prefixo pré-computado para out_row
+            for (dst, src) in out_row.iter_mut().zip(prefix_row.iter()) {
+                dst.clear();
+                dst.push_str(src);
             }
 
-            let mut row_valid = true;
-            for col in columns {
-                let vi = col.input_index;
-                let actual_idx = if vi < static_cols {
-                    vi
-                } else {
-                    static_cols + group_idx * group_size + (vi - static_cols)
-                };
+            let mut group_valid = true;
+            for col in columns.iter().filter(|c| c.input_index >= static_cols) {
+                let offset_in_group = col.input_index - static_cols;
+                let actual_idx = static_cols + group_idx * group_size + offset_in_group;
                 let val = record.get(actual_idx).unwrap_or("");
-
                 let mut transformed: Cow<'_, str> = Cow::Borrowed(val);
                 for op in &col.ops {
                     transformed = apply_op(op, transformed);
                 }
                 if let Some(v) = &col.validate {
                     if !v.check(&transformed) {
-                        row_valid = false;
+                        group_valid = false;
                         break;
                     }
                 }
                 out_row[col.output_index].push_str(&transformed);
             }
 
-            if !row_valid {
+            if !group_valid {
                 invalid_count += 1;
                 continue;
             }
@@ -228,6 +272,23 @@ pub fn process_records_denormalize<R: std::io::Read, W: std::io::Write>(
             }
 
             wtr.write_record(out_row.iter())
+                .map_err(|e| e.to_string())?;
+            output_count += 1;
+            groups_emitted += 1;
+        }
+
+        // === Passo 3: fallback prefix-only ===
+        // Se prefixo passou, mas nenhum grupo foi escrito, opcionalmente
+        // emite uma única linha com só o prefixo (colunas do grupo em branco).
+        if emit_prefix_on_all_invalid && groups_emitted == 0 {
+            if escape_formulas {
+                for slot in prefix_row.iter_mut() {
+                    if needs_formula_escape(slot) {
+                        slot.insert(0, '\'');
+                    }
+                }
+            }
+            wtr.write_record(prefix_row.iter())
                 .map_err(|e| e.to_string())?;
             output_count += 1;
         }
@@ -597,7 +658,8 @@ impl FileProcessor {
     /// `columns_json` descreve **uma linha normalizada de saída** — os `in`
     /// dos columns são índices da linha virtual de tamanho
     /// `static_cols + group_size`, não do arquivo de entrada bruto. Ver
-    /// [`process_records_denormalize`] para detalhes.
+    /// [`process_records_denormalize`] para detalhes, incluindo o
+    /// significado de `emit_prefix_on_all_invalid`.
     #[allow(clippy::too_many_arguments)]
     pub fn process_parallel_denormalize_impl(
         &self,
@@ -612,6 +674,7 @@ impl FileProcessor {
         columns_json: &str,
         escape_formulas: bool,
         quote_style: &str,
+        emit_prefix_on_all_invalid: bool,
     ) -> Result<Vec<i64>, String> {
         if static_cols < 0 {
             return Err("static_cols must be >= 0".to_string());
@@ -665,6 +728,7 @@ impl FileProcessor {
                     group_size_u,
                     escape_formulas,
                     qs,
+                    emit_prefix_on_all_invalid,
                 )?;
                 Ok((buffer, input, output, invalid))
             })
@@ -829,6 +893,7 @@ impl FileProcessor {
         columns_json: String,
         escape_formulas: Option<bool>,
         quote_style: Option<String>,
+        emit_prefix_on_all_invalid: Option<bool>,
     ) -> PhpResult<Vec<i64>> {
         self.process_parallel_denormalize_impl(
             &input_path,
@@ -842,6 +907,7 @@ impl FileProcessor {
             &columns_json,
             escape_formulas.unwrap_or(true),
             quote_style.as_deref().unwrap_or("necessary"),
+            emit_prefix_on_all_invalid.unwrap_or(false),
         )
         .map_err(Into::into)
     }
@@ -1878,6 +1944,7 @@ mod tests {
             2, // group_size
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap();
 
@@ -1917,6 +1984,7 @@ mod tests {
             2,
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap();
 
@@ -1956,6 +2024,7 @@ mod tests {
             2,
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap();
 
@@ -1990,6 +2059,7 @@ mod tests {
             2,
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap();
 
@@ -2024,6 +2094,7 @@ mod tests {
             2,
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap();
 
@@ -2056,6 +2127,7 @@ mod tests {
             2,
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("exceeds virtual row width"));
@@ -2078,6 +2150,7 @@ mod tests {
             0, // group_size inválido
             false,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("group_size"));
@@ -2108,6 +2181,7 @@ mod tests {
             2,
             true,
             csv::QuoteStyle::Necessary,
+            false,
         )
         .unwrap();
 
@@ -2139,6 +2213,7 @@ mod tests {
             2,
             false,                   // escape_formulas off
             csv::QuoteStyle::Never,   // no quoting
+            false,                   // emit_prefix_on_all_invalid
         )
         .unwrap();
 
@@ -2146,6 +2221,270 @@ mod tests {
             output,
             b"doc;11;1111\ndoc;22;2222\n"
         );
+    }
+
+    // ===========================================================
+    // emit_prefix_on_all_invalid (doc-keep fallback)
+    // ===========================================================
+
+    #[test]
+    fn denormalize_emit_prefix_when_all_groups_invalid() {
+        // doc válido + 1 grupo com DDD=0 (inválido) e phone válido.
+        // Sem flag: grupo dropado, zero saídas.
+        // Com flag: saída com doc preenchido e DDD/phone em branco.
+        let input: &[u8] = b"33176825404;0;987148038\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Never,
+            true, // emit_prefix_on_all_invalid
+        )
+        .unwrap();
+
+        assert_eq!((i, o, inv), (1, 1, 1));
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "33176825404;;\n");
+    }
+
+    #[test]
+    fn denormalize_no_emit_when_flag_off_and_all_invalid() {
+        // Comportamento default (flag off): grupos inválidos → nenhuma saída.
+        let input: &[u8] = b"33176825404;0;987148038\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Never,
+            false, // flag OFF
+        )
+        .unwrap();
+
+        assert_eq!((i, o, inv), (1, 0, 1));
+        assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn denormalize_prefix_alone_when_some_groups_valid() {
+        // doc válido + 2 grupos: 1 válido, 1 inválido.
+        // Com flag ativo: emite apenas o grupo válido, NÃO emite prefix-only
+        // (o fallback só dispara se zero grupos passaram).
+        let input: &[u8] = b"33176825404;82;987148038;0;987432606\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Never,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!((i, o, inv), (1, 1, 1));
+        assert_eq!(
+            std::str::from_utf8(&output).unwrap(),
+            "33176825404;82;987148038\n"
+        );
+    }
+
+    #[test]
+    fn denormalize_drops_row_when_document_invalid_even_with_flag() {
+        // Documento inválido → linha inteira dropada, sem fallback
+        // mesmo com o flag ligado (prefixo não passa na validação).
+        let input: &[u8] = b"00000000000;82;987148038\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Never,
+            true,
+        )
+        .unwrap();
+
+        // Doc inválido: zero output, zero invalid (nem tentou grupos).
+        assert_eq!((i, o, inv), (1, 0, 0));
+        assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn denormalize_emits_prefix_for_row_with_only_document() {
+        // Linha só com o doc (1 coluna, zero grupos). Com flag ligado,
+        // emite prefix-only.
+        let input: &[u8] = b"33176825404\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        let (i, o, inv) = process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Never,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!((i, o, inv), (1, 1, 0));
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "33176825404;;\n");
+    }
+
+    #[test]
+    fn denormalize_emit_prefix_preserves_prefix_ops() {
+        // Ops no prefixo (ex.: digits_only em "123.456.789-09") são aplicadas
+        // tanto nas saídas regulares quanto no fallback prefix-only.
+        let input: &[u8] = b"123.456.789-09;0;987148038\n";
+        let mut output: Vec<u8> = Vec::new();
+        let columns = parse_columns(
+            r#"[
+                {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+            ]"#,
+        )
+        .unwrap();
+
+        process_records_denormalize(
+            input,
+            &mut output,
+            b';',
+            b';',
+            false,
+            &columns,
+            1,
+            2,
+            false,
+            csv::QuoteStyle::Never,
+            true,
+        )
+        .unwrap();
+
+        // Formatação removida pelo digits_only no prefixo do fallback
+        assert_eq!(std::str::from_utf8(&output).unwrap(), "12345678909;;\n");
+    }
+
+    #[test]
+    fn parallel_denormalize_user_scenario_keep_doc_on_invalid_ddd() {
+        // Teste completo via process_parallel_denormalize_impl com o cenário
+        // real do usuário: arquivo com mistura de linhas válidas e DDD=0.
+        let dir = unique_temp_dir("pp_denorm_keep_doc");
+        let input = dir.join("in.csv");
+        let output = dir.join("out.csv");
+        write_file(
+            &input,
+            "33176825404;82;987148038;82;987432606\n\
+             34829718897;0;997979072\n\
+             33176906315;85;987348663\n",
+        );
+
+        let fp = FileProcessor;
+        let res = fp
+            .process_parallel_denormalize_impl(
+                path_str(&input),
+                path_str(&output),
+                2,
+                ";",
+                ";",
+                false,
+                1,
+                2,
+                r#"[
+                    {"in":0,"out":0,"ops":["digits_only"],"validate":"document"},
+                    {"in":1,"out":1,"ops":["digits_only"],"validate":"area_code"},
+                    {"in":2,"out":2,"ops":["digits_only"],"validate":"phone"}
+                ]"#,
+                false,
+                "never",
+                true, // emit_prefix_on_all_invalid
+            )
+            .unwrap();
+
+        // 3 inputs:
+        //   linha 1: 2 grupos válidos → 2 outputs, 0 invalid
+        //   linha 2: 1 grupo DDD=0 inválido → 0 outputs de grupo + 1 fallback = 1 output, 1 invalid
+        //   linha 3: 1 grupo válido → 1 output, 0 invalid
+        // Totais: in=3, out=4, invalid=1
+        assert_eq!(res, vec![3, 4, 1]);
+
+        let out = read_file(&output);
+        let expected = "33176825404;82;987148038\n\
+                        33176825404;82;987432606\n\
+                        34829718897;;\n\
+                        33176906315;85;987348663\n";
+        assert_eq!(out, expected);
     }
 
     // ===========================================================
@@ -2183,6 +2522,7 @@ mod tests {
                 ]"#,
                 false,
                 "never",
+                false,
             )
             .unwrap();
 
@@ -2247,6 +2587,7 @@ mod tests {
                 layout,
                 false,
                 "never",
+                false,
             )
             .unwrap();
         let flat_totals = fp
@@ -2299,6 +2640,7 @@ mod tests {
                 ]"#,
                 false,
                 "never",
+                false,
             )
             .unwrap();
 
@@ -2330,6 +2672,7 @@ mod tests {
                 r#"[{"in":5,"out":0,"ops":[]}]"#, // virtual width = 3, in:5 é inválido
                 false,
                 "never",
+                false,
             )
             .unwrap_err();
         assert!(err.contains("exceeds virtual row width"));
