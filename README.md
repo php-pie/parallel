@@ -88,7 +88,7 @@ cargo build --release
 ```bash
 # Diretório para extensões
 mkdir -p ~/php-ext
-cp target/release/librust_etl.dylib ~/php-ext/rust_etl.so
+cp target/release/libparallel.dylib ~/php-ext/parallel.so
 ```
 
 #### 6. Configuração no php.ini
@@ -103,14 +103,14 @@ Adicione ao `php.ini`:
 
 ```ini
 extension_dir = "/Users/SEU_USUARIO/php-ext"
-extension = rust_etl.so
+extension = parallel.so
 ```
 
 #### 7. Verificação
 
 ```bash
-php -m | grep rust_etl
-php --re rust_etl
+php -m | grep parallel
+php --re parallel
 ```
 
 #### Observação para Laravel Herd
@@ -137,33 +137,33 @@ sudo apt install -y php8.4-dev libclang-dev build-essential pkg-config
 cargo build --release
 ```
 
-Gera `target/release/librust_etl.so`.
+Gera `target/release/libparallel.so`.
 
 #### 3. Instalação
 
 ```bash
-sudo cp target/release/librust_etl.so "$(php-config --extension-dir)/rust_etl.so"
+sudo cp target/release/libparallel.so "$(php-config --extension-dir)/parallel.so"
 ```
 
 #### 4. Configuração
 
-Crie `/etc/php/8.4/mods-available/rust_etl.ini`:
+Crie `/etc/php/8.4/mods-available/parallel.ini`:
 
 ```ini
-extension=rust_etl.so
+extension=parallel.so
 ```
 
 Habilite para CLI e FPM:
 
 ```bash
-sudo phpenmod -v 8.4 rust_etl
+sudo phpenmod -v 8.4 parallel
 sudo systemctl restart php8.4-fpm
 ```
 
 #### 5. Verificação
 
 ```bash
-php -m | grep rust_etl
+php -m | grep parallel
 ```
 
 ### Notas de compilação
@@ -347,8 +347,35 @@ As operações são aplicadas **na ordem declarada**. Em `["digits_only", "pad_l
 |---|---|
 | `cpf` | 11 dígitos, dígitos verificadores válidos, rejeita sequências repetidas (ex: `11111111111`) |
 | `phone_br` | 10 ou 11 dígitos, DDD não começa com 0, celular (11 dígitos) deve ter `9` na terceira posição |
+| `cnpj` | 14 dígitos, dígitos verificadores válidos, rejeita sequências repetidas. Aceita formatado (`11.222.333/0001-81`) |
+| `email` | Heurística: `local@dominio` com ponto no domínio, sem espaços, um único `@` |
+| `length:<min>:<max>` | Contagem de chars (UTF-8, não bytes) no intervalo `[min, max]` |
+| `regex:<padrão>` | Sintaxe regex da crate [`regex`](https://docs.rs/regex/). Compilado uma vez por layout |
 
 Se uma coluna com `validate` falhar, a **linha inteira** é descartada e contabilizada em `invalid_count`.
+
+Exemplos:
+
+```json
+[
+    {"in": 0, "out": 0, "ops": ["digits_only"], "validate": "cnpj"},
+    {"in": 1, "out": 1, "ops": ["trim", "lowercase"], "validate": "email"},
+    {"in": 2, "out": 2, "ops": ["trim"], "validate": "length:3:50"},
+    {"in": 3, "out": 3, "ops": [], "validate": "regex:^[A-Z]{2}\\d{4}$"}
+]
+```
+
+### Validação estrita do layout
+
+A partir da versão atual, o layout JSON é validado estritamente no início da chamada. Isso significa que **ops desconhecidas, validadores desconhecidos ou parâmetros inválidos geram erro imediato** — não são mais ignorados silenciosamente. Mensagens de erro incluem o índice da coluna para facilitar o diagnóstico:
+
+```
+column 2: ops[1]: unknown operation 'ditigs_only'; expected one of: trim, digits_only, uppercase, lowercase, pad_left, strip_ddi
+column 3: unknown validator 'passport'; expected one of: cpf, phone_br, cnpj, email, length, regex
+column 1: length requires both min and max: 'length:<min>:<max>'
+```
+
+Erros do layout aparecem como exceção PHP antes de qualquer arquivo ser aberto.
 
 ---
 
@@ -606,6 +633,10 @@ try {
 - **Callbacks PHP:** não suporta callbacks PHP dentro do processamento paralelo. Toda lógica deve ser expressa via layout declarativo.
 - **Layouts customizados:** para transformações que não existem no conjunto padrão, é necessário estendê-las em Rust e recompilar.
 
+## CSV
+
+O parsing segue RFC 4180 via crate [`csv`](https://docs.rs/csv/): campos entre aspas (`"..."`), delimitador embutido dentro de aspas, aspas escapadas (`""`), e `CRLF`/`LF` são tratados corretamente. Na saída, `csv::Writer` re-quota automaticamente campos que contenham o delimitador configurado ou aspas. O terminador de linha da saída é sempre `\n`.
+
 ---
 
 ## Troubleshooting
@@ -624,11 +655,13 @@ Falta a configuração do linker em `.cargo/config.toml`. Ver seção de instala
 
 ### `The current version of PHP is not supported`
 
-A versão do `ext-php-rs` usada no build não suporta sua versão do PHP. Para PHP 8.4, use a branch `master`:
+A versão do `ext-php-rs` usada no build não suporta sua versão do PHP. O projeto hoje pina um commit específico do `ext-php-rs` em `Cargo.toml` para garantir reprodutibilidade:
 
 ```toml
-ext-php-rs = { git = "https://github.com/davidcole1340/ext-php-rs", branch = "master" }
+ext-php-rs = { git = "https://github.com/davidcole1340/ext-php-rs", rev = "0b8bf6a557948f4bde24d6f7e179d702ba090613" }
 ```
+
+Se precisar bumpar (ex.: nova versão do PHP), troque o `rev` por um commit mais recente do `master` do upstream e rode `cargo update -p ext-php-rs`.
 
 ### Extensão carrega mas classe `FileProcessor` não existe
 
@@ -646,3 +679,23 @@ pub fn module(module: ModuleBuilder) -> ModuleBuilder {
 - Confirme que compilou com `--release`
 - Confirme o número de threads vs cores disponíveis (`nproc` no Linux, `sysctl -n hw.ncpu` no macOS)
 - Arquivos muito pequenos (<10MB) têm ganho menor — o overhead fixo domina
+
+---
+
+## Desenvolvimento
+
+### Rodando os testes
+
+A lógica pura (validadores, ops, parsing de layout, pipeline de arquivos) é isolada do layer PHP via a feature Cargo `extension` (default). Para testar sem precisar do runtime PHP:
+
+```bash
+cargo test --no-default-features
+```
+
+Os testes cobrem validadores (cpf, phone_br, cnpj, email, length, regex), operações (incluindo casos no-op onde o `Cow` evita alocação), parsing estrito de JSON e o pipeline completo `split → process_chunks → merge` com arquivos temporários.
+
+Para compilar a extensão PHP propriamente dita (com `ext-php-rs` linkado):
+
+```bash
+cargo build --release
+```
